@@ -61,6 +61,13 @@ mkdir -p "${JOB_DIR}"
 mkdir "${JOB_DIR}/task"
 
 cp "src/eval/tasks/${EVALUATION_TASK}/${EVAL_SCRIPT}" "${JOB_DIR}/task/evaluate.py"
+# hv-patches (upstream PR #45): aime2025 now ships a local scorer next to
+# evaluate.py; carry those modules into the agent's task dir too.
+for _extra_module in score.py task.py; do
+    if [ -f "src/eval/tasks/${EVALUATION_TASK}/${_extra_module}" ]; then
+        cp "src/eval/tasks/${EVALUATION_TASK}/${_extra_module}" "${JOB_DIR}/task"
+    fi
+done
 if [ -d "src/eval/tasks/${EVALUATION_TASK}/evaluation_code" ]; then
     cp -r "src/eval/tasks/${EVALUATION_TASK}/evaluation_code" "${JOB_DIR}/task"
 fi
@@ -222,6 +229,14 @@ solve_task() {
     # can honor it. Only set when the user opts in via .env.
     CLI_UPDATE_ENV=()
     [ -n "${POST_TRAIN_BENCH_SKIP_CLI_UPDATE:-}" ] && CLI_UPDATE_ENV+=(--env "POST_TRAIN_BENCH_SKIP_CLI_UPDATE=${POST_TRAIN_BENCH_SKIP_CLI_UPDATE}")
+    # hv-patches: --cleanenv drops CUDA_VISIBLE_DEVICES, so on a shared
+    # multi-GPU box every job sees all GPUs and check_cuda.py's
+    # `device_count != NUM_GPUS` test fails. Forward an explicit pin, plus the
+    # two check_cuda.py relaxations (see src/utils/check_cuda.py).
+    GPU_PIN_ENV=()
+    [ -n "${POST_TRAIN_BENCH_CUDA_VISIBLE_DEVICES:-}" ] && GPU_PIN_ENV+=(--env "CUDA_VISIBLE_DEVICES=${POST_TRAIN_BENCH_CUDA_VISIBLE_DEVICES}")
+    [ -n "${POST_TRAIN_BENCH_GPU_NAME_MATCH+x}" ] && GPU_PIN_ENV+=(--env "POST_TRAIN_BENCH_GPU_NAME_MATCH=${POST_TRAIN_BENCH_GPU_NAME_MATCH}")
+    [ -n "${POST_TRAIN_BENCH_ALLOW_BUSY_GPU:-}" ] && GPU_PIN_ENV+=(--env "POST_TRAIN_BENCH_ALLOW_BUSY_GPU=${POST_TRAIN_BENCH_ALLOW_BUSY_GPU}")
     timeout --signal=TERM --kill-after=30s "$((NUM_HOURS * 60 + 5))m" \
     apptainer exec \
         --nv \
@@ -238,6 +253,7 @@ solve_task() {
         --env PROMPT="${PROMPT}" \
         --env AGENT_CONFIG="${AGENT_CONFIG}" \
         "${CLI_UPDATE_ENV[@]}" \
+        "${GPU_PIN_ENV[@]}" \
         --bind "${JOB_TMP}:/tmp" \
         --bind "${HF_MERGED}:${HF_HOME_NEW}" \
         "${AGENT_AUTH_BIND[@]}" \
@@ -261,24 +277,51 @@ solve_task() {
 echo "================================"
 echo "======= JUDGE AUTH CHECK ======="
 echo "================================"
+# hv-patches: upstream hard-requires a ChatGPT-Pro subscription auth.json here
+# and exits BEFORE the agent runs. We have no such subscription, and the
+# deterministic part of the pipeline (agent + evaluate.py -> metrics.json) does
+# not need one. Three modes now:
+#   POST_TRAIN_BENCH_JUDGE_AUTH_MODE=chatgpt (default) -> upstream behaviour
+#   POST_TRAIN_BENCH_JUDGE_AUTH_MODE=apikey           -> require CODEX_API_KEY/OPENAI_API_KEY
+#   POST_TRAIN_BENCH_JUDGE_AUTH_MODE=skip             -> no judges; warn and continue
+JUDGE_AUTH_MODE="${POST_TRAIN_BENCH_JUDGE_AUTH_MODE:-chatgpt}"
 JUDGE_AUTH="agents/codex_non_api/auth.json"
-if [ ! -f "$JUDGE_AUTH" ]; then
-    echo "ERROR: judge auth file missing at $JUDGE_AUTH" >&2
+case "$JUDGE_AUTH_MODE" in
+skip)
+    echo "WARNING: judge auth precheck skipped (POST_TRAIN_BENCH_JUDGE_AUTH_MODE=skip)." >&2
+    echo "WARNING: the four Codex-CLI judges will not produce verdicts for this run." >&2
+    ;;
+apikey)
+    if [ -z "${CODEX_API_KEY}" ] && [ -z "${OPENAI_API_KEY}" ]; then
+        echo "ERROR: POST_TRAIN_BENCH_JUDGE_AUTH_MODE=apikey but neither CODEX_API_KEY nor OPENAI_API_KEY is set" >&2
+        exit 1
+    fi
+    echo "Judge auth: API key mode (judges must be run with an API-key login)"
+    ;;
+chatgpt)
+    if [ ! -f "$JUDGE_AUTH" ]; then
+        echo "ERROR: judge auth file missing at $JUDGE_AUTH" >&2
+        exit 1
+    fi
+    JUDGE_ACCESS=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tokens"]["access_token"])' "$JUDGE_AUTH") \
+        || { echo "ERROR: could not extract tokens.access_token from $JUDGE_AUTH" >&2; exit 1; }
+    JUDGE_HTTP=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+        -H "Authorization: Bearer $JUDGE_ACCESS" \
+        "https://chatgpt.com/backend-api/codex/models?client_version=0.124.0")
+    if [ "$JUDGE_HTTP" != "200" ]; then
+        echo "ERROR: judge OAuth precheck failed (HTTP ${JUDGE_HTTP})." >&2
+        echo "The ChatGPT session in $JUDGE_AUTH may be invalidated." >&2
+        echo "Re-login on the head node:" >&2
+        echo "  codex logout && codex login && cp ~/.codex/auth.json $JUDGE_AUTH && chmod 600 $JUDGE_AUTH" >&2
+        exit 1
+    fi
+    echo "Judge OAuth OK (HTTP 200)"
+    ;;
+*)
+    echo "ERROR: unknown POST_TRAIN_BENCH_JUDGE_AUTH_MODE='${JUDGE_AUTH_MODE}' (want chatgpt|apikey|skip)" >&2
     exit 1
-fi
-JUDGE_ACCESS=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tokens"]["access_token"])' "$JUDGE_AUTH") \
-    || { echo "ERROR: could not extract tokens.access_token from $JUDGE_AUTH" >&2; exit 1; }
-JUDGE_HTTP=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
-    -H "Authorization: Bearer $JUDGE_ACCESS" \
-    "https://chatgpt.com/backend-api/codex/models?client_version=0.124.0")
-if [ "$JUDGE_HTTP" != "200" ]; then
-    echo "ERROR: judge OAuth precheck failed (HTTP ${JUDGE_HTTP})." >&2
-    echo "The ChatGPT session in $JUDGE_AUTH may be invalidated." >&2
-    echo "Re-login on the head node:" >&2
-    echo "  codex logout && codex login && cp ~/.codex/auth.json $JUDGE_AUTH && chmod 600 $JUDGE_AUTH" >&2
-    exit 1
-fi
-echo "Judge OAuth OK (HTTP 200)"
+    ;;
+esac
 
 echo "================================"
 echo "========= RUNNING TASK ========="
@@ -350,6 +393,15 @@ echo "========================================="
 echo "=== RUNNING REWARD-HACKING JUDGES ==="
 echo "========================================="
 
+# hv-patches: the four judges all need the ChatGPT-Pro Codex CLI login. When the
+# precheck above ran in `skip` mode there is no login, and
+# setup_judge_codex_auth would `exit 1` before evaluate.py ever runs. Skip the
+# whole judge phase in that case; the deterministic score still gets produced.
+if [ "$JUDGE_AUTH_MODE" = "skip" ]; then
+    echo "SKIPPED: POST_TRAIN_BENCH_JUDGE_AUTH_MODE=skip -> no judge verdicts for this run." >&2
+    echo "SKIPPED: scripts/collect.py will refuse to aggregate this run until verdicts exist." >&2
+else
+
 source src/judges/judge_lib.sh
 
 # Make judge helper tooling and benchmark metadata available inside the judge
@@ -390,6 +442,8 @@ for JUDGE_NAME in "${ALL_JUDGES[@]}"; do
     collect_judge_output "${JOB_DIR}" "${EVAL_DIR}" "" 0
 done
 
+fi  # hv-patches: end of JUDGE_AUTH_MODE != skip
+
 echo "================================"
 echo "========= EVALUATING ==========="
 echo "================================"
@@ -403,8 +457,24 @@ export EVAL_COUNTER=0
 run_evaluation() {
     local max_tokens_arg="$1"
     local eval_num="$2"
-    nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9
+    # hv-patches (SAFETY): upstream assumes an exclusively-allocated HTCondor
+    # node and SIGKILLs *every* CUDA process on the box before each eval
+    # attempt. On a shared workstation that murders other users' jobs. Opt out
+    # with POST_TRAIN_BENCH_KILL_GPU_PROCS=0; default stays upstream behaviour.
+    if [ "${POST_TRAIN_BENCH_KILL_GPU_PROCS:-1}" = "1" ]; then
+        nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9
+    else
+        echo "POST_TRAIN_BENCH_KILL_GPU_PROCS=0: not killing other GPU processes" >&2
+    fi
     sleep 5
+    # hv-patches: two smoke knobs, both defaulting to upstream behaviour.
+    #   POST_TRAIN_BENCH_EVAL_LIMIT      -> --limit (upstream: -1, all samples)
+    #   POST_TRAIN_BENCH_EVAL_CONTAINER  -> eval .sif name (upstream: vllm_debug)
+    # plus the same CUDA_VISIBLE_DEVICES pin as the agent phase.
+    local eval_limit="${POST_TRAIN_BENCH_EVAL_LIMIT:--1}"
+    local eval_sif="${POST_TRAIN_BENCH_EVAL_CONTAINER:-vllm_debug}"
+    local gpu_pin=()
+    [ -n "${POST_TRAIN_BENCH_CUDA_VISIBLE_DEVICES:-}" ] && gpu_pin=(--env "CUDA_VISIBLE_DEVICES=${POST_TRAIN_BENCH_CUDA_VISIBLE_DEVICES}")
     with_huggingface_overlay apptainer exec \
         --nv \
         --env "HF_HOME=${TMP_HF_CACHE}" \
@@ -412,14 +482,15 @@ run_evaluation() {
         --env OPENROUTER_API_KEY="${OPENROUTER_API_KEY}" \
         --env VLLM_API_KEY="inspectai" \
         --env PYTHONNOUSERSITE="1" \
+        "${gpu_pin[@]}" \
         --writable-tmpfs \
         --bind "${REPO_ROOT}:${REPO_ROOT}" \
         --bind "${HF_MERGED}:${TMP_HF_CACHE}" \
         --pwd "$(pwd)/src/eval/tasks/${EVALUATION_TASK}" \
-        ${POST_TRAIN_BENCH_CONTAINERS_DIR}/vllm_debug.sif python "${EVAL_SCRIPT}" \
+        ${POST_TRAIN_BENCH_CONTAINERS_DIR}/${eval_sif}.sif python "${EVAL_SCRIPT}" \
             --model-path "$EVAL_DIR/final_model" \
             --templates-dir ../../../../src/eval/templates \
-            --limit -1 \
+            --limit "${eval_limit}" \
             ${max_tokens_arg} \
             --json-output-file "${EVAL_DIR}/metrics.json" > "$EVAL_DIR/final_eval_${eval_num}.txt"
 }
