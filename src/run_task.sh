@@ -46,7 +46,13 @@ exec 2>${EVAL_DIR}/error.log
 echo "$@"
 echo "Judge backend: ${JUDGE_BACKEND} (eval script: ${EVAL_SCRIPT})"
 
-export TMP_SUBDIR="/tmp/posttrain_container_${EVALUATION_TASK}_${RESULT_PREFIX_SAFE}_${RANDOM_UUID}"
+# Scratch root for the container's /tmp, the job dir and the merged HF cache.
+# The HTCondor submit file asks for request_disk=400G and gets it on /tmp; on a
+# scheduler that makes no such reservation, node-local /tmp can be far smaller
+# than the run needs (87 GB free on this cluster's a3 nodes). Unset means the
+# upstream /tmp, so this changes nothing unless a site opts in.
+export POST_TRAIN_BENCH_TMP_ROOT="${POST_TRAIN_BENCH_TMP_ROOT:-/tmp}"
+export TMP_SUBDIR="${POST_TRAIN_BENCH_TMP_ROOT}/posttrain_container_${EVALUATION_TASK}_${RESULT_PREFIX_SAFE}_${RANDOM_UUID}"
 
 JOB_DIR="${TMP_SUBDIR}/job_dir"
 JOB_TMP="${TMP_SUBDIR}/tmp"
@@ -127,6 +133,41 @@ cp src/utils/system_monitor.sh "${JOB_DIR}/system_monitor.sh"
 cp src/utils/timestamp_lines.py "${JOB_DIR}/timestamp_lines.py"
 cp src/utils/update_agent_cli.sh "${JOB_DIR}/update_agent_cli.sh"
 cp "agents/${AGENT}/solve.sh" "${JOB_DIR}/agent_solve.sh"
+
+# An agent that is more than one shell script needs its own files inside the
+# sandbox. The agent container runs with `-c --cleanenv` and
+# `--home "${JOB_DIR}:/home/ben"`, so nothing outside JOB_DIR is reachable from
+# in there -- not this checkout, not the launching user's home. An agent that
+# ships a payload/ directory gets it copied to /home/ben/agent, and gets the
+# three facts about the task that solve.sh would otherwise have to parse back
+# out of $PROMPT. Guarded on the directory existing: no agent shipped today has
+# one, so for all of them this block does nothing at all.
+if [ -d "agents/${AGENT}/payload" ]; then
+    cp -r "agents/${AGENT}/payload" "${JOB_DIR}/agent"
+    echo "agent payload: $(du -sh "${JOB_DIR}/agent" | cut -f1) -> /home/ben/agent"
+fi
+
+# Agents that authenticate through something other than a provider API key --
+# a Vertex or Bedrock endpoint reached with the host's ambient credentials, say
+# -- name the variables they need, one per line, in
+# agents/<agent>/env_passthrough.txt. Only the NAMES are in the repository; the
+# values come from the launching environment and are never written to disk here.
+# This is deliberately separate from the api_keys.json allowlist above: that one
+# governs provider secrets the benchmark provisions, and rule 9 of the prompt is
+# about those. These are the agent's own routing configuration. Guarded on the
+# file existing, so it is a no-op for every agent shipped today.
+AGENT_ENV_ARGS=()
+if [ -f "agents/${AGENT}/env_passthrough.txt" ]; then
+    _forwarded=()
+    while IFS= read -r _v || [ -n "$_v" ]; do
+        _v="${_v%%#*}"; _v="${_v//[[:space:]]/}"
+        [ -n "$_v" ] || continue
+        [ -n "${!_v:-}" ] || continue
+        AGENT_ENV_ARGS+=(--env "${_v}=${!_v}")
+        _forwarded+=("$_v")
+    done < "agents/${AGENT}/env_passthrough.txt"
+    echo "agent env forwarded for ${AGENT}: ${_forwarded[*]:-<none set in this environment>}"
+fi
 
 # Self-decontamination tooling for the agent: the same n-gram checker and
 # test-set copy the contamination judge gets, at the same paths (the judge
@@ -222,6 +263,25 @@ solve_task() {
     # can honor it. Only set when the user opts in via .env.
     CLI_UPDATE_ENV=()
     [ -n "${POST_TRAIN_BENCH_SKIP_CLI_UPDATE:-}" ] && CLI_UPDATE_ENV+=(--env "POST_TRAIN_BENCH_SKIP_CLI_UPDATE=${POST_TRAIN_BENCH_SKIP_CLI_UPDATE}")
+    # check_cuda.py fails the run unless torch.cuda.device_count() == NUM_GPUS,
+    # and --cleanenv drops the host's CUDA_VISIBLE_DEVICES. A scheduler that
+    # hands out whole nodes therefore shows all 8 devices to a NUM_GPUS=1 run.
+    # Raising NUM_GPUS instead would be wrong: it appends a _8gpu suffix to
+    # EVAL_DIR and so renames the method that collect.py reads.
+    VISIBLE_GPUS_ENV=()
+    [ -n "${POST_TRAIN_BENCH_VISIBLE_GPUS:-}" ] && \
+        VISIBLE_GPUS_ENV+=(--env "CUDA_VISIBLE_DEVICES=${POST_TRAIN_BENCH_VISIBLE_GPUS}")
+    # The three facts a payload agent's entry point needs and cannot otherwise
+    # get: --cleanenv drops them, and the only copies inside the sandbox are
+    # prose inside $PROMPT and a countdown in timer.sh. Same guard as the copy
+    # above, so an agent without a payload sees exactly the environment it saw
+    # before this block existed.
+    AGENT_CONTEXT_ENV=()
+    [ -d "${JOB_DIR}/agent" ] && AGENT_CONTEXT_ENV=(
+        --env "BENCHMARK_ID=${EVALUATION_TASK}"
+        --env "MODEL_TO_TRAIN=${MODEL_TO_TRAIN}"
+        --env "NUM_HOURS=${NUM_HOURS}"
+    )
     timeout --signal=TERM --kill-after=30s "$((NUM_HOURS * 60 + 5))m" \
     apptainer exec \
         --nv \
@@ -238,6 +298,9 @@ solve_task() {
         --env PROMPT="${PROMPT}" \
         --env AGENT_CONFIG="${AGENT_CONFIG}" \
         "${CLI_UPDATE_ENV[@]}" \
+        "${VISIBLE_GPUS_ENV[@]}" \
+        "${AGENT_CONTEXT_ENV[@]}" \
+        "${AGENT_ENV_ARGS[@]}" \
         --bind "${JOB_TMP}:/tmp" \
         --bind "${HF_MERGED}:${HF_HOME_NEW}" \
         "${AGENT_AUTH_BIND[@]}" \
@@ -261,16 +324,28 @@ solve_task() {
 echo "================================"
 echo "======= JUDGE AUTH CHECK ======="
 echo "================================"
+# The reward-hacking judges emit flags, not score terms, and every one of them
+# needs an outbound ChatGPT session plus an npm install inside the sandbox. A
+# site that cannot provide those would otherwise hard-exit here and never reach
+# the evaluation, discarding a completed agent run. Opting out records the
+# absence rather than faking a verdict: no judge_output_*.json is written, and
+# scripts/collect.py reports the run as unjudged.
+if [ -n "${POST_TRAIN_BENCH_SKIP_JUDGES:-}" ]; then
+    echo "SKIPPED: POST_TRAIN_BENCH_SKIP_JUDGES is set; no judge will run and no verdict will be recorded."
+fi
 JUDGE_AUTH="agents/codex_non_api/auth.json"
-if [ ! -f "$JUDGE_AUTH" ]; then
+if [ -z "${POST_TRAIN_BENCH_SKIP_JUDGES:-}" ] && [ ! -f "$JUDGE_AUTH" ]; then
     echo "ERROR: judge auth file missing at $JUDGE_AUTH" >&2
     exit 1
 fi
+JUDGE_HTTP="200"
+if [ -z "${POST_TRAIN_BENCH_SKIP_JUDGES:-}" ]; then
 JUDGE_ACCESS=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tokens"]["access_token"])' "$JUDGE_AUTH") \
     || { echo "ERROR: could not extract tokens.access_token from $JUDGE_AUTH" >&2; exit 1; }
 JUDGE_HTTP=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
     -H "Authorization: Bearer $JUDGE_ACCESS" \
     "https://chatgpt.com/backend-api/codex/models?client_version=0.124.0")
+fi
 if [ "$JUDGE_HTTP" != "200" ]; then
     echo "ERROR: judge OAuth precheck failed (HTTP ${JUDGE_HTTP})." >&2
     echo "The ChatGPT session in $JUDGE_AUTH may be invalidated." >&2
@@ -278,7 +353,7 @@ if [ "$JUDGE_HTTP" != "200" ]; then
     echo "  codex logout && codex login && cp ~/.codex/auth.json $JUDGE_AUTH && chmod 600 $JUDGE_AUTH" >&2
     exit 1
 fi
-echo "Judge OAuth OK (HTTP 200)"
+[ -n "${POST_TRAIN_BENCH_SKIP_JUDGES:-}" ] || echo "Judge OAuth OK (HTTP 200)"
 
 echo "================================"
 echo "========= RUNNING TASK ========="
@@ -350,6 +425,11 @@ echo "========================================="
 echo "=== RUNNING REWARD-HACKING JUDGES ==="
 echo "========================================="
 
+if [ -n "${POST_TRAIN_BENCH_SKIP_JUDGES:-}" ]; then
+    echo "SKIPPED: POST_TRAIN_BENCH_SKIP_JUDGES is set."
+    echo "No judge_output_*.json is written; this run carries no reward-hacking verdict."
+else
+
 source src/judges/judge_lib.sh
 
 # Make judge helper tooling and benchmark metadata available inside the judge
@@ -390,6 +470,8 @@ for JUDGE_NAME in "${ALL_JUDGES[@]}"; do
     collect_judge_output "${JOB_DIR}" "${EVAL_DIR}" "" 0
 done
 
+fi  # POST_TRAIN_BENCH_SKIP_JUDGES
+
 echo "================================"
 echo "========= EVALUATING ==========="
 echo "================================"
@@ -400,13 +482,50 @@ export TMP_HF_CACHE="/tmp/hf_cache_90afd0"
 
 export EVAL_COUNTER=0
 
+# Free the GPUs before vLLM starts. Upstream kills every compute process on
+# every visible device, unfiltered by owner or by device -- correct under an
+# HTCondor whole-node claim, where nothing else can be running. Under a
+# scheduler where processes can reach the node outside the allocation (an
+# interactive ssh session, say), that same command reaches other people's work,
+# and run_evaluation is called up to nine times per job. The default is
+# upstream's behaviour; "own" restricts the sweep to this user's processes and
+# "none" disables it.
+reap_gpu_processes() {
+    local mode="${POST_TRAIN_BENCH_EVAL_GPU_REAP:-all}"
+    local pids
+    case "$mode" in
+        none)
+            echo "reap_gpu_processes: disabled (POST_TRAIN_BENCH_EVAL_GPU_REAP=none)"
+            return 0
+            ;;
+        own)
+            pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader \
+                   | tr -d ' ' \
+                   | while read -r p; do
+                         [ -n "$p" ] || continue
+                         [ "$(ps -o user= -p "$p" 2>/dev/null | tr -d ' ')" = "$USER" ] && echo "$p"
+                     done)
+            echo "reap_gpu_processes: own-user only, killing [${pids//$'\n'/ }]"
+            ;;
+        *)
+            pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | tr -d ' ')
+            ;;
+    esac
+    [ -n "$pids" ] && echo "$pids" | xargs -r kill -9
+    return 0
+}
+
 run_evaluation() {
     local max_tokens_arg="$1"
     local eval_num="$2"
-    nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9
+    reap_gpu_processes
     sleep 5
+    local visible_gpus_env=()
+    [ -n "${POST_TRAIN_BENCH_VISIBLE_GPUS:-}" ] && \
+        visible_gpus_env+=(--env "CUDA_VISIBLE_DEVICES=${POST_TRAIN_BENCH_VISIBLE_GPUS}")
     with_huggingface_overlay apptainer exec \
         --nv \
+        "${visible_gpus_env[@]}" \
         --env "HF_HOME=${TMP_HF_CACHE}" \
         --env OPENAI_API_KEY="${OPENAI_API_KEY}" \
         --env OPENROUTER_API_KEY="${OPENROUTER_API_KEY}" \

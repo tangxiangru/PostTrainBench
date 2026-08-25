@@ -13,7 +13,9 @@ RESULT_PREFIX_SAFE=$(echo "${MODEL_NAME}" | tr '/:' '_')
 RESULT_DIR="${POST_TRAIN_BENCH_RESULTS_DIR}/baseline/${EVAL_NAME}_${RESULT_PREFIX_SAFE}_${CLUSTER_ID}"
 
 RANDOM_UUID=$(uuidgen)
-TMP_SUBDIR="/tmp/posttrain_baseline_${EVAL_NAME}_${RESULT_PREFIX_SAFE}_${RANDOM_UUID}"
+# See run_task.sh: node-local /tmp is not guaranteed to be the big scratch that
+# the HTCondor submit file reserves. Unset means the upstream /tmp.
+TMP_SUBDIR="${POST_TRAIN_BENCH_TMP_ROOT:-/tmp}/posttrain_baseline_${EVAL_NAME}_${RESULT_PREFIX_SAFE}_${RANDOM_UUID}"
 HF_MERGED="${TMP_SUBDIR}/merged_huggingface"
 TMP_HF_CACHE="/tmp/hf_cache_baseline"
 
@@ -79,7 +81,7 @@ run_eval() {
     apptainer exec \
         --nv \
         --env HF_HOME="${TMP_HF_CACHE}" \
-        --env OPENAI_API_KEY="${OPENAI_API_KEY}" \
+        --env OPENAI_API_KEY="${OPENAI_API_KEY:-}" \
         --env VLLM_API_KEY="inspectai" \
         --env VLLM_LOGGING_LEVEL="DEBUG" \
         --writable-tmpfs \
