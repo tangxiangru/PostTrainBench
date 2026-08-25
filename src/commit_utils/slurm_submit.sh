@@ -128,8 +128,16 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader | head -8
 
 cd "${REPO_ROOT}"
 source src/commit_utils/set_env_vars.sh
-mkdir -p "\${POST_TRAIN_BENCH_TMP_ROOT:-/tmp}"
-echo "scratch=\${POST_TRAIN_BENCH_TMP_ROOT:-/tmp} free=\$(df -h "\${POST_TRAIN_BENCH_TMP_ROOT:-/tmp}" | tail -1 | awk '{print \$4}')"
+# Fail here rather than deep inside run_task.sh. The scratch root is node-local
+# by design -- request_disk = 400G in single_task.sub -- so it is the one path in
+# this script whose existence is a property of the node the scheduler picked and
+# not of the shared filesystem. A merged model does not fit in a Slurm node's
+# small root /tmp, and the failure that produces arrives an hour in, after the
+# agent has already spent an hour of its budget.
+SCRATCH="\${POST_TRAIN_BENCH_TMP_ROOT:-/tmp}"
+mkdir -p "\$SCRATCH" || { echo "FATAL: cannot create \$SCRATCH on \$(hostname)" >&2; exit 1; }
+[ -w "\$SCRATCH" ] || { echo "FATAL: \$SCRATCH is not writable on \$(hostname)" >&2; exit 1; }
+echo "scratch=\$SCRATCH free=\$(df -h "\$SCRATCH" | tail -1 | awk '{print \$4}')"
 
 ${PAYLOAD}
 rc=\$?
