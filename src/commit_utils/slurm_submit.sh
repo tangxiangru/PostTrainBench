@@ -126,6 +126,14 @@ export CUDA_VISIBLE_DEVICES=0
 export POST_TRAIN_BENCH_VISIBLE_GPUS=0
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader | head -8
 
+# Baked in at generation time, not inherited. sbatch's --export defaults to ALL
+# and this would arrive anyway, but --export is a cluster policy and a pin that
+# silently stops applying is worse than no pin: it would let two arms run two
+# different CLI builds while the submission record says they did not. Empty here
+# means the published behaviour, in which each arm npm-installs the latest CLI.
+export POST_TRAIN_BENCH_SKIP_CLI_UPDATE="${POST_TRAIN_BENCH_SKIP_CLI_UPDATE:-}"
+echo "skip_cli_update=${POST_TRAIN_BENCH_SKIP_CLI_UPDATE:-<unset: each arm updates to latest>}"
+
 cd "${REPO_ROOT}"
 source src/commit_utils/set_env_vars.sh
 # Fail here rather than deep inside run_task.sh. The scratch root is node-local
