@@ -576,7 +576,11 @@ run_evaluation_with_retry() {
         export EVAL_COUNTER
         echo "Evaluation attempt $EVAL_COUNTER (phase attempt $attempt of $max_retries)"
 
-        timeout --signal=TERM --kill-after=60s 28800s bash -c "$(declare -f run_evaluation with_huggingface_overlay); run_evaluation \"$max_tokens_arg\" \"$EVAL_COUNTER\""
+        # reap_gpu_processes has to be in this list. run_evaluation calls it, and
+        # this subshell gets only the functions named here -- upstream had the kill
+        # inline, so `declare -f run_evaluation` carried it and this list did not
+        # have to know about it.
+        timeout --signal=TERM --kill-after=60s 28800s bash -c "$(declare -f run_evaluation with_huggingface_overlay reap_gpu_processes); run_evaluation \"$max_tokens_arg\" \"$EVAL_COUNTER\""
 
         if [ -f "${EVAL_DIR}/metrics.json" ]; then
             return 0

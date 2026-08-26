@@ -33,6 +33,25 @@
 # if that happens the model is already in EVAL_DIR and
 # scripts/rerun_eval_n_times.sh can score it in a separate job.
 #
+# Two things about that recovery path, because it is upstream's script and the
+# reap/container fixes in run_task.sh do not reach it.
+#
+#   * It opens each attempt with an unfiltered
+#     `nvidia-smi --query-compute-apps=pid | xargs -r kill -9` -- every GPU
+#     process on the host, any owner, ignoring POST_TRAIN_BENCH_EVAL_GPU_REAP.
+#     That is exactly the behaviour run_task.sh was patched away from. Only
+#     submit `rerun` as a job on an exclusive node; never run the script on a
+#     login node or on a node holding someone else's work.
+#   * It scores in ${POST_TRAIN_BENCH_CONTAINER_NAME}.sif, while run_task.sh
+#     hardcodes vllm_debug.sif. Left alone it would rescore in whatever agent
+#     image is configured -- a different scorer than the one that produced
+#     metrics.json. This script pins vllm_debug for the rerun payload so the two
+#     numbers come from the same image.
+#
+# And what it produces: <EVAL_DIR>/reruns/run_N.json plus metrics_averaged.json.
+# It never writes metrics.json, so it cannot repair a missing one -- it is a
+# second, differently named number, not a retry of the first.
+#
 # Usage:
 #   slurm_submit.sh baseline <task> <model>
 #   slurm_submit.sh task     <task> <agent> <model> <num_hours> <agent_config>
@@ -90,7 +109,9 @@ case "$MODE" in
         EVAL_DIR_ARG="${1:?eval_dir}"; N="${2:-1}"
         JOB_NAME="ptb-rerun"
         TIME="${PTB_TIME:-08:00:00}"
-        PAYLOAD="bash scripts/rerun_eval_n_times.sh '${EVAL_DIR_ARG}' '${N}'"
+        # vllm_debug, not the configured agent image: rerun_eval_n_times.sh reads
+        # POST_TRAIN_BENCH_CONTAINER_NAME for its evaluation, run_task.sh does not.
+        PAYLOAD="POST_TRAIN_BENCH_CONTAINER_NAME=vllm_debug bash scripts/rerun_eval_n_times.sh '${EVAL_DIR_ARG}' '${N}'"
         ;;
     *)
         echo "unknown mode: $MODE" >&2; exit 1 ;;
