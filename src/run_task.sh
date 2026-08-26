@@ -415,7 +415,18 @@ echo "=== TASK COMPLETE, PARSING AGENT TRACE ==="
 echo "============================================"
 
 # Parse agent trace into human-readable format
-python src/trace_parsing/parse_trace.py --agent "${AGENT}" "${SOLVE_OUT}" -o "${EVAL_DIR}/solve_parsed.txt"
+#
+# --raw-only for an agent that ships a payload/: parse_trace.py dispatches on a
+# substring of the agent name, so "claude_autor" selects the claude parser, which
+# reads the Claude CLI's stream-json. A payload agent writes its own log format
+# and gets a stub plus one "NOT PARSABLE" line per input line on stderr -- into
+# error.log, the file that is supposed to hold this harness's own errors. Raw-only
+# takes the path upstream already has for an unrecognised agent (copy the trace
+# verbatim, still sanitize it). Keyed on the payload directory, not on a name, so
+# it stays true for the next agent that is a repository.
+PARSE_TRACE_ARGS=()
+[ -d "agents/${AGENT}/payload" ] && PARSE_TRACE_ARGS=(--raw-only)
+python src/trace_parsing/parse_trace.py --agent "${AGENT}" "${PARSE_TRACE_ARGS[@]}" "${SOLVE_OUT}" -o "${EVAL_DIR}/solve_parsed.txt"
 cp "${EVAL_DIR}/solve_parsed.txt" "${JOB_DIR}/solve_parsed.txt"
 
 echo "============================="
@@ -535,6 +546,17 @@ reap_gpu_processes() {
 }
 
 run_evaluation() {
+    # EVAL_DIR has to be bound. Every path this function hands the scorer --
+    # --model-path, --json-output-file, and the redirect of final_eval_N.txt --
+    # is under POST_TRAIN_BENCH_RESULTS_DIR, and only REPO_ROOT and the HF cache
+    # are bound here, so with a results dir outside the checkout none of them
+    # exist inside the container. evaluate.py then reads "final_model" as a Hub
+    # repo id and dies on the name, four times and then twice more, and the run
+    # records no metrics.json while every other artifact looks healthy.
+    # Upstream never meets this: example.env's results dir is the relative
+    # "results", which lands inside the REPO_ROOT bind. src/baselines/run_baseline.sh
+    # already binds its own RESULT_DIR -- this is the same bind, in the path that
+    # scores an agent rather than the base model.
     local max_tokens_arg="$1"
     local eval_num="$2"
     reap_gpu_processes
@@ -551,6 +573,7 @@ run_evaluation() {
         --env VLLM_API_KEY="inspectai" \
         --env PYTHONNOUSERSITE="1" \
         --writable-tmpfs \
+        --bind "${EVAL_DIR}:${EVAL_DIR}" \
         --bind "${REPO_ROOT}:${REPO_ROOT}" \
         --bind "${HF_MERGED}:${TMP_HF_CACHE}" \
         --pwd "$(pwd)/src/eval/tasks/${EVALUATION_TASK}" \
@@ -658,3 +681,16 @@ echo $(cat "$EVAL_DIR/final_eval_${EVAL_COUNTER}.txt")
 echo "================================"
 echo "======= EVALUATION DONE ========"
 echo "================================"
+
+# Six evaluation attempts can all fail and this script still ends on an echo, so
+# it exits 0 and the scheduler records COMPLETED over an empty result. Upstream
+# runs under HTCondor with a human reading the directory afterwards; a Slurm
+# queue is read by looking at the state column, and "COMPLETED, no score" is the
+# one outcome that must not look like the good one. Neither retry ladder's return
+# value is checked above -- deliberately, because the first ladder failing and the
+# second succeeding is a normal run -- so the check is on the artifact, not on a
+# status: metrics.json is the whole deliverable of this script.
+if [ ! -f "${EVAL_DIR}/metrics.json" ]; then
+    echo "FATAL: every evaluation attempt failed; ${EVAL_DIR}/metrics.json was never written" >&2
+    exit 1
+fi

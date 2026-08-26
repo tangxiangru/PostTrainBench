@@ -151,7 +151,9 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader | head -8
 # and this would arrive anyway, but --export is a cluster policy and a pin that
 # silently stops applying is worse than no pin: it would let two arms run two
 # different CLI builds while the submission record says they did not. Empty here
-# means the published behaviour, in which each arm npm-installs the latest CLI.
+# does not mean unpinned: set_env_vars.sh below treats set-but-empty as unset, so
+# a submitting shell that says nothing leaves the decision to .env, and .env is
+# where the pin belongs -- it is read at job start rather than frozen at submit.
 export POST_TRAIN_BENCH_SKIP_CLI_UPDATE="${POST_TRAIN_BENCH_SKIP_CLI_UPDATE:-}"
 echo "skip_cli_update=${POST_TRAIN_BENCH_SKIP_CLI_UPDATE:-<unset: each arm updates to latest>}"
 
