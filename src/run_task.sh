@@ -283,7 +283,14 @@ solve_task() {
     #
     # NVIDIA_VISIBLE_DEVICES is read by apptainer itself out of the host
     # environment, so it is exported rather than passed with --env. --nvccli
-    # also requires --writable-tmpfs, which this exec already passes.
+    # also requires --writable-tmpfs AND -c, both of which this exec already
+    # passes -- the second is load-bearing and does not look it: stock
+    # apptainer.conf has `mount dev = yes`, which bind-mounts the host /dev back
+    # over the device list nvidia-container-cli just built. Measured on an
+    # 8-H100 node with NVIDIA_VISIBLE_DEVICES=0: --nvccli alone leaves all eight
+    # /dev/nvidia* in the sandbox, -c --nvccli leaves one. Both exit 0 and
+    # neither warns, so dropping -c here would silently un-isolate the run
+    # while every other symptom stayed identical.
     NVCCLI_ARGS=()
     if [ "${POST_TRAIN_BENCH_ISOLATE_GPUS:-}" = "1" ] && [ -n "${POST_TRAIN_BENCH_VISIBLE_GPUS:-}" ]; then
         export NVIDIA_VISIBLE_DEVICES="${POST_TRAIN_BENCH_VISIBLE_GPUS}"
