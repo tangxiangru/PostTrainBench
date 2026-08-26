@@ -271,6 +271,24 @@ solve_task() {
     VISIBLE_GPUS_ENV=()
     [ -n "${POST_TRAIN_BENCH_VISIBLE_GPUS:-}" ] && \
         VISIBLE_GPUS_ENV+=(--env "CUDA_VISIBLE_DEVICES=${POST_TRAIN_BENCH_VISIBLE_GPUS}")
+    # CUDA_VISIBLE_DEVICES is an environment variable, not a device cgroup. It
+    # satisfies check_cuda.py and it is what torch reads, but --nv binds every
+    # /dev/nvidia* on the node, so the agent's own Bash still sees eight cards
+    # in nvidia-smi and one `export` away from using them. HTCondor handed the
+    # published runs a one-GPU cgroup; on an OverSubscribe=EXCLUSIVE partition
+    # nothing does. nvidia-container-cli binds only the listed devices, which
+    # restores the one-H100 contract the task prompt states. Off by default:
+    # it needs nvidia-container-cli on the host, and a cluster whose scheduler
+    # already isolates GPUs does not want a second mechanism doing it.
+    #
+    # NVIDIA_VISIBLE_DEVICES is read by apptainer itself out of the host
+    # environment, so it is exported rather than passed with --env. --nvccli
+    # also requires --writable-tmpfs, which this exec already passes.
+    NVCCLI_ARGS=()
+    if [ "${POST_TRAIN_BENCH_ISOLATE_GPUS:-}" = "1" ] && [ -n "${POST_TRAIN_BENCH_VISIBLE_GPUS:-}" ]; then
+        export NVIDIA_VISIBLE_DEVICES="${POST_TRAIN_BENCH_VISIBLE_GPUS}"
+        NVCCLI_ARGS=(--nvccli)
+    fi
     # The three facts a payload agent's entry point needs and cannot otherwise
     # get: --cleanenv drops them, and the only copies inside the sandbox are
     # prose inside $PROMPT and a countdown in timer.sh. Same guard as the copy
@@ -285,6 +303,7 @@ solve_task() {
     timeout --signal=TERM --kill-after=30s "$((NUM_HOURS * 60 + 5))m" \
     apptainer exec \
         --nv \
+        "${NVCCLI_ARGS[@]}" \
         -c \
         --cleanenv \
         --pid \
