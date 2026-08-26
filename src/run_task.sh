@@ -553,17 +553,19 @@ reap_gpu_processes() {
 }
 
 run_evaluation() {
-    # EVAL_DIR has to be bound. Every path this function hands the scorer --
-    # --model-path, --json-output-file, and the redirect of final_eval_N.txt --
-    # is under POST_TRAIN_BENCH_RESULTS_DIR, and only REPO_ROOT and the HF cache
-    # are bound here, so with a results dir outside the checkout none of them
-    # exist inside the container. evaluate.py then reads "final_model" as a Hub
-    # repo id and dies on the name, four times and then twice more, and the run
-    # records no metrics.json while every other artifact looks healthy.
-    # Upstream never meets this: example.env's results dir is the relative
-    # "results", which lands inside the REPO_ROOT bind. src/baselines/run_baseline.sh
-    # already binds its own RESULT_DIR -- this is the same bind, in the path that
-    # scores an agent rather than the base model.
+    # EVAL_DIR has to be bound. Both paths this function hands the scorer --
+    # --model-path "$EVAL_DIR/final_model" and --json-output-file
+    # "$EVAL_DIR/metrics.json" -- are under POST_TRAIN_BENCH_RESULTS_DIR, and
+    # only REPO_ROOT and the HF cache are bound here, so with a results dir
+    # outside the checkout neither exists inside the container and evaluate.py
+    # cannot load the model it was asked to score. Four attempts, then two more,
+    # and the run records no metrics.json while every other artifact looks
+    # healthy -- including final_eval_N.txt, because that redirect is the host
+    # shell's and lands on the host regardless. Upstream never meets this:
+    # example.env's results dir is the relative "results", which lands inside the
+    # REPO_ROOT bind. src/baselines/run_baseline.sh already binds its own
+    # RESULT_DIR -- this is the same bind, in the path that scores an agent
+    # rather than the base model.
     local max_tokens_arg="$1"
     local eval_num="$2"
     reap_gpu_processes
