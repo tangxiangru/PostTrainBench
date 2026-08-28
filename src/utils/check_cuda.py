@@ -24,18 +24,6 @@ def get_gpu_processes(gpu_index):
 
 def check_h100():
     expected_gpus = int(os.environ.get("NUM_GPUS", "1"))
-    # hv-patches: upstream hard-codes the substring "H100" and additionally
-    # requires the GPU to be idle. Neither holds on our hardware
-    # (4x NVIDIA RTX 6000 Ada Generation, often partly occupied), so both are
-    # now configurable and default to upstream behaviour:
-    #   POST_TRAIN_BENCH_GPU_NAME_MATCH  substring the device name must contain
-    #                                    (comma-separated alternatives; empty
-    #                                    string disables the name check)
-    #   POST_TRAIN_BENCH_ALLOW_BUSY_GPU  "1" -> warn instead of failing when
-    #                                    other processes hold the GPU
-    name_match_raw = os.environ.get("POST_TRAIN_BENCH_GPU_NAME_MATCH", "H100")
-    wanted_names = [s.strip() for s in name_match_raw.split(",") if s.strip()]
-    allow_busy = os.environ.get("POST_TRAIN_BENCH_ALLOW_BUSY_GPU", "0") == "1"
 
     if not torch.cuda.is_available():
         print("❌ CUDA is not available")
@@ -47,34 +35,31 @@ def check_h100():
         print(f"❌ Expected {expected_gpus} GPU(s), got {device_count}")
         return False
 
-    match_found = not wanted_names  # empty allowlist -> name check disabled
+    h100_found = False
     for i in range(device_count):
         name = torch.cuda.get_device_name(i)
         props = torch.cuda.get_device_properties(i)
         print(f"  GPU {i}: {name} ({props.total_memory / 1e9:.1f} GB)")
 
-        if wanted_names and not any(w in name for w in wanted_names):
-            continue
-        match_found = True
+        if "H100" in name:
+            h100_found = True
 
-        # Check for running processes on this GPU
-        processes = get_gpu_processes(i)
-        if processes is None:
-            print(f"  ⚠ Could not check processes on GPU {i} (nvidia-smi failed)")
-        elif processes:
-            print(f"  {'⚠' if allow_busy else '❌'} GPU {i} has {len(processes)} process(es) running:")
-            for pid, mem in processes:
-                print(f"      PID {pid}: {mem:.1f} MiB")
-            if not allow_busy:
+            # Check for running processes on this GPU
+            processes = get_gpu_processes(i)
+            if processes is None:
+                print(f"  ⚠ Could not check processes on GPU {i} (nvidia-smi failed)")
+            elif processes:
+                print(f"  ❌ GPU {i} has {len(processes)} process(es) running:")
+                for pid, mem in processes:
+                    print(f"      PID {pid}: {mem:.1f} MiB")
                 return False
-        else:
-            print(f"  ✓ GPU {i} is idle")
+            else:
+                print(f"  ✓ GPU {i} is idle")
 
-    if match_found:
-        expected_desc = "/".join(wanted_names) if wanted_names else "any GPU"
-        print(f"✓ {expected_desc} detected ({device_count} GPU(s))")
+    if h100_found:
+        print(f"✓ H100 detected ({device_count} GPU(s))")
     else:
-        print(f"❌ No GPU matching {wanted_names} found")
+        print("❌ No H100 found")
         return False
 
     return True
