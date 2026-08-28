@@ -229,14 +229,6 @@ solve_task() {
     # can honor it. Only set when the user opts in via .env.
     CLI_UPDATE_ENV=()
     [ -n "${POST_TRAIN_BENCH_SKIP_CLI_UPDATE:-}" ] && CLI_UPDATE_ENV+=(--env "POST_TRAIN_BENCH_SKIP_CLI_UPDATE=${POST_TRAIN_BENCH_SKIP_CLI_UPDATE}")
-    # hv-patches: --cleanenv drops CUDA_VISIBLE_DEVICES, so on a shared
-    # multi-GPU box every job sees all GPUs and check_cuda.py's
-    # `device_count != NUM_GPUS` test fails. Forward an explicit pin, plus the
-    # two check_cuda.py relaxations (see src/utils/check_cuda.py).
-    GPU_PIN_ENV=()
-    [ -n "${POST_TRAIN_BENCH_CUDA_VISIBLE_DEVICES:-}" ] && GPU_PIN_ENV+=(--env "CUDA_VISIBLE_DEVICES=${POST_TRAIN_BENCH_CUDA_VISIBLE_DEVICES}")
-    [ -n "${POST_TRAIN_BENCH_GPU_NAME_MATCH+x}" ] && GPU_PIN_ENV+=(--env "POST_TRAIN_BENCH_GPU_NAME_MATCH=${POST_TRAIN_BENCH_GPU_NAME_MATCH}")
-    [ -n "${POST_TRAIN_BENCH_ALLOW_BUSY_GPU:-}" ] && GPU_PIN_ENV+=(--env "POST_TRAIN_BENCH_ALLOW_BUSY_GPU=${POST_TRAIN_BENCH_ALLOW_BUSY_GPU}")
     timeout --signal=TERM --kill-after=30s "$((NUM_HOURS * 60 + 5))m" \
     apptainer exec \
         --nv \
@@ -253,7 +245,6 @@ solve_task() {
         --env PROMPT="${PROMPT}" \
         --env AGENT_CONFIG="${AGENT_CONFIG}" \
         "${CLI_UPDATE_ENV[@]}" \
-        "${GPU_PIN_ENV[@]}" \
         --bind "${JOB_TMP}:/tmp" \
         --bind "${HF_MERGED}:${HF_HOME_NEW}" \
         "${AGENT_AUTH_BIND[@]}" \
@@ -457,24 +448,8 @@ export EVAL_COUNTER=0
 run_evaluation() {
     local max_tokens_arg="$1"
     local eval_num="$2"
-    # hv-patches (SAFETY): upstream assumes an exclusively-allocated HTCondor
-    # node and SIGKILLs *every* CUDA process on the box before each eval
-    # attempt. On a shared workstation that murders other users' jobs. Opt out
-    # with POST_TRAIN_BENCH_KILL_GPU_PROCS=0; default stays upstream behaviour.
-    if [ "${POST_TRAIN_BENCH_KILL_GPU_PROCS:-1}" = "1" ]; then
-        nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9
-    else
-        echo "POST_TRAIN_BENCH_KILL_GPU_PROCS=0: not killing other GPU processes" >&2
-    fi
+    nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9
     sleep 5
-    # hv-patches: two smoke knobs, both defaulting to upstream behaviour.
-    #   POST_TRAIN_BENCH_EVAL_LIMIT      -> --limit (upstream: -1, all samples)
-    #   POST_TRAIN_BENCH_EVAL_CONTAINER  -> eval .sif name (upstream: vllm_debug)
-    # plus the same CUDA_VISIBLE_DEVICES pin as the agent phase.
-    local eval_limit="${POST_TRAIN_BENCH_EVAL_LIMIT:--1}"
-    local eval_sif="${POST_TRAIN_BENCH_EVAL_CONTAINER:-vllm_debug}"
-    local gpu_pin=()
-    [ -n "${POST_TRAIN_BENCH_CUDA_VISIBLE_DEVICES:-}" ] && gpu_pin=(--env "CUDA_VISIBLE_DEVICES=${POST_TRAIN_BENCH_CUDA_VISIBLE_DEVICES}")
     with_huggingface_overlay apptainer exec \
         --nv \
         --env "HF_HOME=${TMP_HF_CACHE}" \
@@ -482,15 +457,14 @@ run_evaluation() {
         --env OPENROUTER_API_KEY="${OPENROUTER_API_KEY}" \
         --env VLLM_API_KEY="inspectai" \
         --env PYTHONNOUSERSITE="1" \
-        "${gpu_pin[@]}" \
         --writable-tmpfs \
         --bind "${REPO_ROOT}:${REPO_ROOT}" \
         --bind "${HF_MERGED}:${TMP_HF_CACHE}" \
         --pwd "$(pwd)/src/eval/tasks/${EVALUATION_TASK}" \
-        ${POST_TRAIN_BENCH_CONTAINERS_DIR}/${eval_sif}.sif python "${EVAL_SCRIPT}" \
+        ${POST_TRAIN_BENCH_CONTAINERS_DIR}/vllm_debug.sif python "${EVAL_SCRIPT}" \
             --model-path "$EVAL_DIR/final_model" \
             --templates-dir ../../../../src/eval/templates \
-            --limit "${eval_limit}" \
+            --limit -1 \
             ${max_tokens_arg} \
             --json-output-file "${EVAL_DIR}/metrics.json" > "$EVAL_DIR/final_eval_${eval_num}.txt"
 }
