@@ -268,9 +268,26 @@ solve_task() {
     # hands out whole nodes therefore shows all 8 devices to a NUM_GPUS=1 run.
     # Raising NUM_GPUS instead would be wrong: it appends a _8gpu suffix to
     # EVAL_DIR and so renames the method that collect.py reads.
+    #
+    # The value is the host index only when nothing renumbers the devices.
+    # nvidia-container-cli injects *only* the listed cards and renumbers them from
+    # zero, so under POST_TRAIN_BENCH_ISOLATE_GPUS=1 the sandbox holds one card at
+    # index 0 whichever card it is: POST_TRAIN_BENCH_VISIBLE_GPUS=3 with
+    # CUDA_VISIBLE_DEVICES=3 selects nothing, torch reports no CUDA at all, and
+    # check_cuda.py ends the run two minutes in with an empty final_model. GPU 0 is
+    # the single index where the two numberings agree, and a scheduler that hands
+    # out whole nodes always starts at 0 -- so every one-cell run on this cluster
+    # passed and this stayed invisible until six cells shared a node and five of
+    # them died the same way.
     VISIBLE_GPUS_ENV=()
-    [ -n "${POST_TRAIN_BENCH_VISIBLE_GPUS:-}" ] && \
-        VISIBLE_GPUS_ENV+=(--env "CUDA_VISIBLE_DEVICES=${POST_TRAIN_BENCH_VISIBLE_GPUS}")
+    if [ -n "${POST_TRAIN_BENCH_VISIBLE_GPUS:-}" ]; then
+        AGENT_CUDA_VISIBLE="${POST_TRAIN_BENCH_VISIBLE_GPUS}"
+        if [ "${POST_TRAIN_BENCH_ISOLATE_GPUS:-}" = "1" ]; then
+            AGENT_CUDA_VISIBLE=$(seq -s, 0 "$(( $(awk -F, '{print NF}' <<<"${POST_TRAIN_BENCH_VISIBLE_GPUS}") - 1 ))")
+        fi
+        VISIBLE_GPUS_ENV+=(--env "CUDA_VISIBLE_DEVICES=${AGENT_CUDA_VISIBLE}")
+        echo "agent gpu: host [${POST_TRAIN_BENCH_VISIBLE_GPUS}] -> container CUDA_VISIBLE_DEVICES=[${AGENT_CUDA_VISIBLE}] (isolate=${POST_TRAIN_BENCH_ISOLATE_GPUS:-0})"
+    fi
     # CUDA_VISIBLE_DEVICES is an environment variable, not a device cgroup. It
     # satisfies check_cuda.py and it is what torch reads, but --nv binds every
     # /dev/nvidia* on the node, so the agent's own Bash still sees eight cards
@@ -307,6 +324,15 @@ solve_task() {
         --env "MODEL_TO_TRAIN=${MODEL_TO_TRAIN}"
         --env "NUM_HOURS=${NUM_HOURS}"
     )
+    # SOLVE_EXIT below is meant to say whether the agent worked. It did not: the
+    # brace group ended with `kill $MONITOR_PID`, so its status was the kill's, and
+    # the group was piped into timestamp_lines.py, so the pipeline's status was
+    # python's. Both are 0 essentially always. A cell whose check_cuda.py refused to
+    # start the agent at all therefore recorded `exit_code: 0 / status: exited
+    # normally` beside `final_model_files: 0`, and the only field that disagreed was
+    # the one nobody reads first. pipefail plus an explicit exit makes the number
+    # mean what its label says; nothing downstream branches on it, so an honest
+    # nonzero costs nothing and a dishonest zero cost five cells.
     timeout --signal=TERM --kill-after=30s "$((NUM_HOURS * 60 + 5))m" \
     apptainer exec \
         --nv \
@@ -336,7 +362,7 @@ solve_task() {
         --pwd "/home/ben/task" \
         --writable-tmpfs \
         "${POST_TRAIN_BENCH_CONTAINERS_DIR}/${POST_TRAIN_BENCH_CONTAINER_NAME}.sif" \
-        bash -c "{ python /home/ben/check_cuda.py && python /home/ben/check_cuda_writing.py || exit 1; bash /home/ben/system_monitor.sh & MONITOR_PID=\$!; bash /home/ben/agent_solve.sh; kill \$MONITOR_PID 2>/dev/null; } 2>&1 | python /home/ben/timestamp_lines.py" > "${SOLVE_OUT}" 2>&1
+        bash -c "set -o pipefail; { python /home/ben/check_cuda.py && python /home/ben/check_cuda_writing.py || exit 1; bash /home/ben/system_monitor.sh & MONITOR_PID=\$!; bash /home/ben/agent_solve.sh; SOLVE_RC=\$?; kill \$MONITOR_PID 2>/dev/null; exit \$SOLVE_RC; } 2>&1 | python /home/ben/timestamp_lines.py" > "${SOLVE_OUT}" 2>&1
 }
 
 # ---------- judge OAuth precheck ----------
