@@ -517,6 +517,39 @@ export REPO_ROOT="$(pwd)"
 
 export TMP_HF_CACHE="/tmp/hf_cache_90afd0"
 
+# The scorer's container does not run --cleanenv, so the host's cache variables
+# reach inside it and outrank the --env below. huggingface_hub ranks
+# HF_HUB_CACHE > HUGGINGFACE_HUB_CACHE > "$HF_HOME/hub", and this cluster exports
+# the middle one globally; XDG_CACHE_HOME is exported too, and it is where
+# anything without a variable of its own lands -- vLLM's VLLM_CACHE_ROOT defaults
+# to "$XDG_CACHE_HOME/vllm", torch inductor's triton kernels go there as well.
+# None of that root is bound in, so each write is created on the container root,
+# which --writable-tmpfs caps at `sessiondir max size` (64 MiB here).
+#
+# Left unfixed this costs a whole job and looks like nothing: the agent finishes,
+# final_model is written, and then all nine evaluation attempts die at vLLM
+# startup with
+#
+#     torch._inductor.exc.InductorError: OSError: [Errno 28] No space left
+#
+# on a node with terabytes free. Job 81521 spent an hour of opus and produced
+# final_eval_1..9.txt and no metrics.json. Naming the three HF variables keeps the
+# scorer reading the per-invocation overlay rather than the shared hub; binding
+# the cache root covers everything else, including the next library to invent a
+# variable, and keeps compiled triton kernels between the nine attempts.
+#
+# The agent sandbox needs neither: it launches with -c --cleanenv, so none of
+# these ever reached it, which is why only the scorer failed.
+#
+# Both lists are built inside run_evaluation rather than out here, for the reason
+# the comment above run_evaluation_with_retry's `declare -f` already gives once:
+# that line starts a fresh `bash -c` which receives exported variables and the
+# named function bodies, and nothing else. Bash cannot export an array. Defined at
+# this level they would arrive empty, "${CACHE_BIND[@]}" would expand to nothing,
+# and the exec would silently go back to the form that fails -- the same shape of
+# bug, in the same file, one scope over. Inside the function `declare -f` carries
+# them and they cannot drift out of the list.
+
 export EVAL_COUNTER=0
 
 # Free the GPUs before vLLM starts. Upstream kills every compute process on
@@ -570,13 +603,22 @@ run_evaluation() {
     local eval_num="$2"
     reap_gpu_processes
     sleep 5
+    local hf_cache_env=(
+        --env "HF_HOME=${TMP_HF_CACHE}"
+        --env "HF_HUB_CACHE=${TMP_HF_CACHE}/hub"
+        --env "HUGGINGFACE_HUB_CACHE=${TMP_HF_CACHE}/hub"
+    )
+    local cache_bind=()
+    [ -n "${XDG_CACHE_HOME:-}" ] && [ -d "${XDG_CACHE_HOME}" ] && \
+        cache_bind=(--bind "${XDG_CACHE_HOME}:${XDG_CACHE_HOME}")
     local visible_gpus_env=()
     [ -n "${POST_TRAIN_BENCH_VISIBLE_GPUS:-}" ] && \
         visible_gpus_env+=(--env "CUDA_VISIBLE_DEVICES=${POST_TRAIN_BENCH_VISIBLE_GPUS}")
     with_huggingface_overlay apptainer exec \
         --nv \
         "${visible_gpus_env[@]}" \
-        --env "HF_HOME=${TMP_HF_CACHE}" \
+        "${hf_cache_env[@]}" \
+        "${cache_bind[@]}" \
         --env OPENAI_API_KEY="${OPENAI_API_KEY}" \
         --env OPENROUTER_API_KEY="${OPENROUTER_API_KEY}" \
         --env VLLM_API_KEY="inspectai" \
