@@ -560,25 +560,38 @@ export EVAL_COUNTER=0
 # and run_evaluation is called up to nine times per job. The default is
 # upstream's behaviour; "own" restricts the sweep to this user's processes and
 # "none" disables it.
+#
+# Owner is not a fine enough filter here. On an EXCLUSIVE whole-node partition the only
+# economical shape is several cells sharing one node, one GPU each, all of them the same
+# POSIX user -- and several humans share this account besides. "own" then sweeps every
+# H100 on the box and kills the sibling cells' vLLM servers, hours in, leaving nothing in
+# either log but a scorer that restarted. So the query is scoped to the device this cell
+# was given: `nvidia-smi -i "$VISIBLE"` takes the same index CUDA_VISIBLE_DEVICES does and
+# exits 0. When the variable is unset the behaviour is exactly what it was -- all devices
+# -- because a job that did not say which GPU is its own has not claimed one.
 reap_gpu_processes() {
     local mode="${POST_TRAIN_BENCH_EVAL_GPU_REAP:-all}"
     local pids
+    local device_arg=()
+    [ -n "${POST_TRAIN_BENCH_VISIBLE_GPUS:-}" ] && \
+        device_arg=(-i "${POST_TRAIN_BENCH_VISIBLE_GPUS}")
     case "$mode" in
         none)
             echo "reap_gpu_processes: disabled (POST_TRAIN_BENCH_EVAL_GPU_REAP=none)"
             return 0
             ;;
         own)
-            pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader \
+            pids=$(nvidia-smi "${device_arg[@]}" --query-compute-apps=pid --format=csv,noheader \
                    | tr -d ' ' \
                    | while read -r p; do
                          [ -n "$p" ] || continue
                          [ "$(ps -o user= -p "$p" 2>/dev/null | tr -d ' ')" = "$USER" ] && echo "$p"
                      done)
-            echo "reap_gpu_processes: own-user only, killing [${pids//$'\n'/ }]"
+            echo "reap_gpu_processes: own-user on gpu [${POST_TRAIN_BENCH_VISIBLE_GPUS:-all}], killing [${pids//$'\n'/ }]"
             ;;
         *)
-            pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | tr -d ' ')
+            pids=$(nvidia-smi "${device_arg[@]}" --query-compute-apps=pid --format=csv,noheader | tr -d ' ')
+            echo "reap_gpu_processes: all users on gpu [${POST_TRAIN_BENCH_VISIBLE_GPUS:-all}], killing [${pids//$'\n'/ }]"
             ;;
     esac
     [ -n "$pids" ] && echo "$pids" | xargs -r kill -9
