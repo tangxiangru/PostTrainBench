@@ -65,11 +65,17 @@ The `.env` file contains API keys and configuration. See `example.env` for all a
 | `POST_TRAIN_BENCH_CONTAINERS_DIR` | Directory for containers | `containers` |
 | `POST_TRAIN_BENCH_CONTAINER_NAME` | Container name | `standard` |
 | `POST_TRAIN_BENCH_PROMPT` | Prompt variant | `prompt` |
-| `POST_TRAIN_BENCH_JOB_SCHEDULER` | Job scheduler (`htcondor` or `htcondor_mpi-is`) | `htcondor` |
+| `POST_TRAIN_BENCH_JOB_SCHEDULER` | Job scheduler (`htcondor`, `htcondor_mpi-is`, or this fork's `slurm` adapter) | `htcondor` |
+| `POST_TRAIN_BENCH_JUDGE_PROFILE` | Reward-hacking judge profile (`official` or research-only `claude`) | `official` |
 
 Environment variables already set in your shell take precedence over `.env` values.
 
-Currently, we only support the HTCondor job scheduler. [Harbor](https://github.com/harbor-framework/harbor) support is planned.
+Upstream currently supports only HTCondor. This fork also provides a GRES/device-cgroup [Slurm adapter](src/commit_utils/slurm/README.md) for non-exclusive single-GPU cells. [Harbor](https://github.com/harbor-framework/harbor) support is planned upstream.
+
+This fork's reward-hacking judges have an opt-in [Claude profile](src/judges/README.md):
+Claude Code runs the same shared judge prompts as the official Codex profile, using the
+`opus` alias with explicit `xhigh` effort. Claude verdicts use isolated
+`judgement_claude_*` names and are not consumed as canonical benchmark verdicts.
 
 #### API-based agents
 

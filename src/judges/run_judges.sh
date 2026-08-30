@@ -22,12 +22,15 @@
 # All outputs are always saved with the _rerun suffix so original judge
 # outputs produced by src/run_task.sh are preserved.
 #
-# Usage: run_judges.sh [--judges <name>[,<name>...]] <result_dir>
+# Usage: run_judges.sh [--profile official|claude]
+#                      [--judges <name>[,<name>...]] <result_dir>
 #
 # Options:
 #   --judges   Comma-separated subset of judges to run (default: all).
 #              e.g. --judges data_contamination_judge
 #                   --judges api_usage_judge
+#   --profile  Judge runtime/output profile (default: .env or official).
+#              The claude profile writes separate judgement_claude_* files.
 
 set -e
 
@@ -37,15 +40,20 @@ source "$SCRIPT_DIR/judge_lib.sh"
 # Parse arguments
 JUDGES=()
 RESULT_DIR=""
+REQUESTED_PROFILE=""
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --profile)
+            REQUESTED_PROFILE="$2"
+            shift 2
+            ;;
         --judges)
             IFS=',' read -r -a JUDGES <<< "$2"
             shift 2
             ;;
         -*)
             echo "Unknown option: $1" >&2
-            echo "Usage: $0 [--judges <name>[,<name>...]] <result_dir>" >&2
+            echo "Usage: $0 [--profile official|claude] [--judges <name>[,<name>...]] <result_dir>" >&2
             exit 1
             ;;
         *)
@@ -60,7 +68,7 @@ if [ ${#JUDGES[@]} -eq 0 ]; then
 fi
 
 if [ -z "$RESULT_DIR" ]; then
-    echo "Usage: $0 [--judges <name>[,<name>...]] <result_dir>" >&2
+    echo "Usage: $0 [--profile official|claude] [--judges <name>[,<name>...]] <result_dir>" >&2
     exit 1
 fi
 
@@ -73,6 +81,12 @@ if [ ! -d "$RESULT_DIR/task" ]; then
     echo "Error: No task directory found in $RESULT_DIR" >&2
     exit 1
 fi
+
+source "$JUDGES_REPO_ROOT/src/commit_utils/set_env_vars.sh"
+if [ -n "$REQUESTED_PROFILE" ]; then
+    export POST_TRAIN_BENCH_JUDGE_PROFILE="$REQUESTED_PROFILE"
+fi
+configure_judge_profile "${POST_TRAIN_BENCH_JUDGE_PROFILE:-official}"
 
 # Validate the requested judges early (before any expensive work).
 for JUDGE_NAME in "${JUDGES[@]}"; do
@@ -91,24 +105,38 @@ else
     exit 1
 fi
 
-source "$JUDGES_REPO_ROOT/src/commit_utils/set_env_vars.sh"
-
-# Parse result directory to get benchmark and model
-# Format: {benchmark}_{provider}_{model}_{cluster_id}
-DIRNAME=$(basename "$RESULT_DIR")
-BENCHMARK=$(echo "$DIRNAME" | sed -E 's/^([^_]+)_.*/\1/')
-MODEL_PART=$(echo "$DIRNAME" | sed -E 's/^[^_]+_(.*)_[0-9]+$/\1/')
-MODEL_HF=$(echo "$MODEL_PART" | sed 's/_/\//')
-
-# Parse the parent (method) directory to get the agent + its harness model.
-# Format: {agent}_{agent_config}_{num_hours}h[_{num_gpus}gpu][{experiment_name}]
-METHOD_DIR=$(basename "$(dirname "$RESULT_DIR")")
-AGENT_AND_CONFIG=$(echo "$METHOD_DIR" | sed -E 's/_[0-9]+h.*$//')
-AGENT=$(echo "$AGENT_AND_CONFIG" | sed -E 's/^([^_]+)_.*/\1/')
-AGENT_CONFIG=$(echo "$AGENT_AND_CONFIG" | sed -E 's/^[^_]+_(.*)$/\1/')
+# New Slurm runs carry unambiguous structured provenance. Prefer it because
+# directory names cannot reliably split agents such as claude_vertex_xhigh or
+# base-model ids containing underscores. Keep the historical heuristic for old
+# result directories that predate runtime_provenance.json.
+if [ -r "$RESULT_DIR/runtime_provenance.json" ]; then
+    mapfile -t RESULT_IDENTITY < <(python3 - "$RESULT_DIR/runtime_provenance.json" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))["experiment"]
+print(data["task"])
+print(data["base_model"])
+print(data["agent"])
+print(data["agent_config"])
+PY
+    )
+    BENCHMARK="${RESULT_IDENTITY[0]}"
+    MODEL_HF="${RESULT_IDENTITY[1]}"
+    AGENT="${RESULT_IDENTITY[2]}"
+    AGENT_CONFIG="${RESULT_IDENTITY[3]}"
+else
+    DIRNAME=$(basename "$RESULT_DIR")
+    BENCHMARK=$(echo "$DIRNAME" | sed -E 's/^([^_]+)_.*/\1/')
+    MODEL_PART=$(echo "$DIRNAME" | sed -E 's/^[^_]+_(.*)_[0-9]+$/\1/')
+    MODEL_HF=$(echo "$MODEL_PART" | sed 's/_/\//')
+    METHOD_DIR=$(basename "$(dirname "$RESULT_DIR")")
+    AGENT_AND_CONFIG=$(echo "$METHOD_DIR" | sed -E 's/_[0-9]+h.*$//')
+    AGENT=$(echo "$AGENT_AND_CONFIG" | sed -E 's/^([^_]+)_.*/\1/')
+    AGENT_CONFIG=$(echo "$AGENT_AND_CONFIG" | sed -E 's/^[^_]+_(.*)$/\1/')
+fi
 
 echo "Running judges on: $RESULT_DIR"
 echo "  Benchmark: $BENCHMARK | Model: $MODEL_HF | Agent: $AGENT ($AGENT_CONFIG) | Trace: $TRACE_NAME"
+echo "  Profile: $JUDGE_PROFILE ($PTB_JUDGE_BACKEND, model=$JUDGE_DEFAULT_MODEL, effort=$JUDGE_DEFAULT_REASONING_EFFORT)"
 echo "  Judges: ${JUDGES[*]} (outputs suffixed with _rerun)"
 
 # Create temporary working directory
@@ -132,8 +160,8 @@ cp "$TRACE_FILE" "$JOB_DIR/$TRACE_NAME"
 # Copy judge helper tooling and benchmark metadata into the sandbox.
 prepare_judge_sandbox "$JOB_DIR" "$BENCHMARK" "$RESULT_DIR/final_model/config.json"
 
-# Set up codex config + ChatGPT Pro subscription auth (JUDGE_CODEX_AUTH_SRC).
-setup_judge_codex_auth "$JOB_DIR"
+# Set up profile-specific isolated config/auth.
+setup_judge_auth "$JOB_DIR"
 
 # Remove any pre-existing per-judge output files in the result dir for the
 # judges we are about to rerun, so stale values from earlier runs can't be

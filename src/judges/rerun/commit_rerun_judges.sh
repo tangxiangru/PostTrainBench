@@ -15,6 +15,7 @@
 #   --judges <a,b>   Comma-separated judges to rerun (default: all judges;
 #                    see ALL_JUDGES in ../judge_lib.sh). e.g.
 #                    --judges data_contamination_judge
+#   --profile <name>  Runtime/output profile: official (default) or claude.
 #   --dry-run        Print the result directories that would be submitted, but
 #                    do not actually call condor_submit_bid.
 #   --skip-existing  Per result dir, only rerun the selected judges whose
@@ -33,14 +34,18 @@ source "$SCRIPT_DIR/../judge_lib.sh"
 DRY_RUN=""
 SKIP_EXISTING=""
 JUDGES=()
+PROFILE="official"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --judges) IFS=',' read -r -a JUDGES <<< "$2"; shift 2 ;;
+        --profile) PROFILE="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --skip-existing) SKIP_EXISTING=1; shift ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+case "$PROFILE" in official|claude) ;; *) echo "ERROR: --profile must be official or claude" >&2; exit 1 ;; esac
+export POST_TRAIN_BENCH_JUDGE_PROFILE="$PROFILE"
 
 if [ ${#JUDGES[@]} -eq 0 ]; then
     JUDGES=("${ALL_JUDGES[@]}")
@@ -74,6 +79,7 @@ fi
 TOTAL=$(echo "$RESULT_DIRS" | grep -c .)
 echo "Found $TOTAL latest-only result directories across all methods in $POST_TRAIN_BENCH_RESULTS_DIR"
 echo "Judges: ${JUDGES[*]}"
+echo "Profile: $PROFILE"
 if [ -n "$SKIP_EXISTING" ]; then
     echo "  --skip-existing: skipping judges whose judgement_<id>_rerun.json already exists"
 fi
@@ -122,6 +128,7 @@ while read -r result_dir; do
     SUBMIT_OUT=$(condor_submit_bid 100 \
         -a "result_dir=$result_dir" \
         -a "judges=$JUDGES_ARG" \
+        -a "profile=$PROFILE" \
         "$SUB_FILE" 2>&1)
     echo "$SUBMIT_OUT" | tail -2
     CLUSTER_ID=$(echo "$SUBMIT_OUT" | grep -oE 'cluster [0-9]+' | awk '{print $2}' | tail -1)

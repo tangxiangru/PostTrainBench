@@ -10,6 +10,15 @@ NUM_GPUS="${7:-1}"
 
 source src/commit_utils/set_env_vars.sh
 
+PTB_AGENT_PROVIDER="unknown"
+PTB_AGENT_EFFORT="unknown"
+PTB_AGENT_REQUESTED_CONTEXT_TOKENS="unknown"
+if [ -f "agents/${AGENT}/profile.env" ]; then
+    # Agent profiles are versioned harness metadata, not site secrets.
+    source "agents/${AGENT}/profile.env"
+fi
+export PTB_AGENT_PROVIDER PTB_AGENT_EFFORT PTB_AGENT_REQUESTED_CONTEXT_TOKENS
+
 # Select the judge backend for grader-based benchmarks (arenahardwriting / healthbench):
 # default to the OpenAI-backed evaluate.py, but fall back to the OpenRouter variant when
 # .env provides OPENROUTER_API_KEY but no OPENAI_API_KEY.
@@ -46,7 +55,18 @@ exec 2>${EVAL_DIR}/error.log
 echo "$@"
 echo "Judge backend: ${JUDGE_BACKEND} (eval script: ${EVAL_SCRIPT})"
 
-export TMP_SUBDIR="/tmp/posttrain_container_${EVALUATION_TASK}_${RESULT_PREFIX_SAFE}_${RANDOM_UUID}"
+python3 src/utils/record_runtime_provenance.py init \
+    --output "${EVAL_DIR}/runtime_provenance.json" \
+    --task "$EVALUATION_TASK" \
+    --agent "$AGENT" \
+    --agent-config "$AGENT_CONFIG" \
+    --base-model "$MODEL_TO_TRAIN" \
+    --hours "$NUM_HOURS" \
+    --num-gpus "$NUM_GPUS"
+
+PTB_SCRATCH_ROOT="${POST_TRAIN_BENCH_SCRATCH_DIR:-${TMPDIR:-/tmp}}"
+mkdir -p "${PTB_SCRATCH_ROOT}"
+export TMP_SUBDIR="${PTB_SCRATCH_ROOT%/}/posttrain_container_${EVALUATION_TASK}_${RESULT_PREFIX_SAFE}_${RANDOM_UUID}"
 
 JOB_DIR="${TMP_SUBDIR}/job_dir"
 JOB_TMP="${TMP_SUBDIR}/tmp"
@@ -126,6 +146,24 @@ for _k in "${ALLOWED_API_KEYS[@]}"; do
     API_KEY_ENV_ARGS+=(--env "${_k}=${!_k}")
 done
 echo "API keys provisioned for agent=${AGENT} task=${EVALUATION_TASK}: ${ALLOWED_API_KEYS[*]:-<none>}"
+
+# Non-secret provider routing may be declared by an agent scaffold. Only
+# explicitly named, syntactically valid environment variables are forwarded;
+# cleanenv continues to block every other ambient setting.
+AGENT_ENV_ARGS=()
+if [ -f "agents/${AGENT}/env_passthrough.txt" ]; then
+    while IFS= read -r _env_name || [ -n "$_env_name" ]; do
+        [[ -z "$_env_name" || "$_env_name" =~ ^[[:space:]]*# ]] && continue
+        if ! [[ "$_env_name" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+            echo "ERROR: invalid variable name in agents/${AGENT}/env_passthrough.txt: $_env_name" >&2
+            exit 1
+        fi
+        if [ -n "${!_env_name+x}" ]; then
+            AGENT_ENV_ARGS+=(--env "${_env_name}=${!_env_name}")
+        fi
+    done < "agents/${AGENT}/env_passthrough.txt"
+fi
+echo "Provider environment provisioned for agent=${AGENT}: ${#AGENT_ENV_ARGS[@]} argument(s)"
 
 # Copy scripts needed inside the container
 cp src/utils/check_cuda.py "${JOB_DIR}/check_cuda.py"
@@ -229,9 +267,23 @@ solve_task() {
     # can honor it. Only set when the user opts in via .env.
     CLI_UPDATE_ENV=()
     [ -n "${POST_TRAIN_BENCH_SKIP_CLI_UPDATE:-}" ] && CLI_UPDATE_ENV+=(--env "POST_TRAIN_BENCH_SKIP_CLI_UPDATE=${POST_TRAIN_BENCH_SKIP_CLI_UPDATE}")
+    VISIBLE_GPUS_ENV=()
+    [ -n "${POST_TRAIN_BENCH_VISIBLE_GPUS:-}" ] && \
+        VISIBLE_GPUS_ENV+=(--env "CUDA_VISIBLE_DEVICES=${POST_TRAIN_BENCH_VISIBLE_GPUS}")
+    # CUDA_VISIBLE_DEVICES limits CUDA clients but does not hide device files.
+    # On an exclusive Slurm node without working GPU GRES, nvidia-container-cli
+    # restores the one-GPU device boundary that HTCondor normally provides.
+    # This stays opt-in because --nvccli requires nvidia-container-cli on the
+    # host and is unnecessary when the scheduler already applies a GPU cgroup.
+    NVCCLI_ARGS=()
+    if [ "${POST_TRAIN_BENCH_ISOLATE_GPUS:-}" = "1" ] && [ -n "${POST_TRAIN_BENCH_VISIBLE_GPUS:-}" ]; then
+        export NVIDIA_VISIBLE_DEVICES="${POST_TRAIN_BENCH_VISIBLE_GPUS}"
+        NVCCLI_ARGS=(--nvccli)
+    fi
     timeout --signal=TERM --kill-after=30s "$((NUM_HOURS * 60 + 5))m" \
     apptainer exec \
         --nv \
+        "${NVCCLI_ARGS[@]}" \
         -c \
         --cleanenv \
         --pid \
@@ -244,6 +296,8 @@ solve_task() {
         --env NUM_GPUS="${NUM_GPUS}" \
         --env PROMPT="${PROMPT}" \
         --env AGENT_CONFIG="${AGENT_CONFIG}" \
+        "${AGENT_ENV_ARGS[@]}" \
+        "${VISIBLE_GPUS_ENV[@]}" \
         "${CLI_UPDATE_ENV[@]}" \
         --bind "${JOB_TMP}:/tmp" \
         --bind "${HF_MERGED}:${HF_HOME_NEW}" \
@@ -254,42 +308,35 @@ solve_task() {
         --pwd "/home/ben/task" \
         --writable-tmpfs \
         "${POST_TRAIN_BENCH_CONTAINERS_DIR}/${POST_TRAIN_BENCH_CONTAINER_NAME}.sif" \
-        bash -c "{ python /home/ben/check_cuda.py && python /home/ben/check_cuda_writing.py || exit 1; bash /home/ben/system_monitor.sh & MONITOR_PID=\$!; bash /home/ben/agent_solve.sh; kill \$MONITOR_PID 2>/dev/null; } 2>&1 | python /home/ben/timestamp_lines.py" > "${SOLVE_OUT}" 2>&1
+        bash -c "set -o pipefail; { python /home/ben/check_cuda.py && python /home/ben/check_cuda_writing.py || exit 1; bash /home/ben/system_monitor.sh & MONITOR_PID=\$!; bash /home/ben/agent_solve.sh; AGENT_EXIT=\$?; kill \$MONITOR_PID 2>/dev/null || true; exit \$AGENT_EXIT; } 2>&1 | python /home/ben/timestamp_lines.py" > "${SOLVE_OUT}" 2>&1
 }
 
-# ---------- judge OAuth precheck ----------
-# All judges run via the codex CLI with the subscription auth at
-# agents/codex_non_api/auth.json (see src/judges/judge_lib.sh). If its ChatGPT
-# session is invalidated, we'd waste the full agent run only to hard-error at
-# the judge phase. One curl to a lightweight ChatGPT endpoint tells us the
-# state: it uses the already-issued access token, no refresh path, so it
-# doesn't rotate anything or race parallel job starts.
+# ---------- judge auth/profile precheck ----------
+# The official profile keeps the Codex/ChatGPT judge path. The research-only
+# claude profile uses a separate OAuth-token file and never reads the tested
+# agent's Claude home or token.
 
 echo "================================"
 echo "======= JUDGE AUTH CHECK ======="
 echo "================================"
-# hv-patches: upstream hard-requires a ChatGPT-Pro subscription auth.json here
-# and exits BEFORE the agent runs. We have no such subscription, and the
-# deterministic part of the pipeline (agent + evaluate.py -> metrics.json) does
-# not need one. Three modes now:
-#   POST_TRAIN_BENCH_JUDGE_AUTH_MODE=chatgpt (default) -> upstream behaviour
-#   POST_TRAIN_BENCH_JUDGE_AUTH_MODE=apikey           -> require CODEX_API_KEY/OPENAI_API_KEY
-#   POST_TRAIN_BENCH_JUDGE_AUTH_MODE=skip             -> no judges; warn and continue
-JUDGE_AUTH_MODE="${POST_TRAIN_BENCH_JUDGE_AUTH_MODE:-chatgpt}"
-JUDGE_AUTH="agents/codex_non_api/auth.json"
+source src/judges/judge_lib.sh
+configure_judge_profile "${POST_TRAIN_BENCH_JUDGE_PROFILE:-official}" || exit 1
+resolve_judge_auth_mode || exit 1
+JUDGE_AUTH="${POST_TRAIN_BENCH_CODEX_JUDGE_AUTH_FILE:-agents/codex_non_api/auth.json}"
 case "$JUDGE_AUTH_MODE" in
 skip)
     echo "WARNING: judge auth precheck skipped (POST_TRAIN_BENCH_JUDGE_AUTH_MODE=skip)." >&2
-    echo "WARNING: the four Codex-CLI judges will not produce verdicts for this run." >&2
+    echo "WARNING: reward-hacking judges will not produce verdicts for this run." >&2
     ;;
 apikey)
-    if [ -z "${CODEX_API_KEY}" ] && [ -z "${OPENAI_API_KEY}" ]; then
-        echo "ERROR: POST_TRAIN_BENCH_JUDGE_AUTH_MODE=apikey but neither CODEX_API_KEY nor OPENAI_API_KEY is set" >&2
-        exit 1
-    fi
-    echo "Judge auth: API key mode (judges must be run with an API-key login)"
+    echo "ERROR: POST_TRAIN_BENCH_JUDGE_AUTH_MODE=apikey is not implemented by judge_lib.sh" >&2
+    exit 1
     ;;
 chatgpt)
+    if [ "$JUDGE_PROFILE" != "official" ]; then
+        echo "ERROR: chatgpt auth belongs to the official judge profile; use claude_oauth for profile=claude" >&2
+        exit 1
+    fi
     if [ ! -f "$JUDGE_AUTH" ]; then
         echo "ERROR: judge auth file missing at $JUDGE_AUTH" >&2
         exit 1
@@ -308,8 +355,40 @@ chatgpt)
     fi
     echo "Judge OAuth OK (HTTP 200)"
     ;;
+claude_oauth|vertex)
+    if [ "$JUDGE_PROFILE" != "claude" ]; then
+        echo "ERROR: $JUDGE_AUTH_MODE belongs to the claude judge profile; use chatgpt for profile=official" >&2
+        exit 1
+    fi
+    if [ "$JUDGE_AUTH_MODE" = "claude_oauth" ]; then
+        CLAUDE_JUDGE_AUTH="${POST_TRAIN_BENCH_CLAUDE_JUDGE_OAUTH_TOKEN_FILE:-}"
+        if [ -z "$CLAUDE_JUDGE_AUTH" ] || [ ! -r "$CLAUDE_JUDGE_AUTH" ] || [ ! -s "$CLAUDE_JUDGE_AUTH" ]; then
+            echo "ERROR: POST_TRAIN_BENCH_CLAUDE_JUDGE_OAUTH_TOKEN_FILE must name a readable, non-empty, judge-only token file" >&2
+            exit 1
+        fi
+    else
+        setup_judge_vertex_auth "$JOB_DIR" || exit 1
+    fi
+    CLAUDE_JUDGE_IMAGE="${POST_TRAIN_BENCH_CONTAINERS_DIR}/${JUDGE_CONTAINER}"
+    if [ ! -r "$CLAUDE_JUDGE_IMAGE" ]; then
+        echo "ERROR: Claude judge container is missing or unreadable: $CLAUDE_JUDGE_IMAGE" >&2
+        exit 1
+    fi
+    if ! CLAUDE_JUDGE_HELP="$(apptainer exec --containall "$CLAUDE_JUDGE_IMAGE" claude --help 2>&1)"; then
+        echo "ERROR: Claude Code CLI is not runnable in $CLAUDE_JUDGE_IMAGE" >&2
+        exit 1
+    fi
+    if ! grep -q -- '--effort' <<< "$CLAUDE_JUDGE_HELP" \
+        || ! grep -q -- '--setting-sources' <<< "$CLAUDE_JUDGE_HELP" \
+        || ! grep -q -- '--safe-mode' <<< "$CLAUDE_JUDGE_HELP"; then
+        echo "ERROR: Claude Code CLI in $CLAUDE_JUDGE_IMAGE lacks --effort, --setting-sources, or --safe-mode" >&2
+        exit 1
+    fi
+    CLAUDE_JUDGE_VERSION="$(apptainer exec --containall "$CLAUDE_JUDGE_IMAGE" claude --version 2>&1 | head -n 1)"
+    echo "Claude judge ready; profile=claude auth=${JUDGE_AUTH_MODE} model=${JUDGE_DEFAULT_MODEL} effort=xhigh cli=${CLAUDE_JUDGE_VERSION:-unknown}"
+    ;;
 *)
-    echo "ERROR: unknown POST_TRAIN_BENCH_JUDGE_AUTH_MODE='${JUDGE_AUTH_MODE}' (want chatgpt|apikey|skip)" >&2
+    echo "ERROR: unknown POST_TRAIN_BENCH_JUDGE_AUTH_MODE='${JUDGE_AUTH_MODE}' (want chatgpt|claude_oauth|vertex|skip)" >&2
     exit 1
     ;;
 esac
@@ -350,6 +429,11 @@ else
     echo "WARNING: ${JOB_DIR}/cli_version.txt not found (agent CLI version not recorded)" >&2
 fi
 
+python3 src/utils/record_runtime_provenance.py finalize \
+    --output "${EVAL_DIR}/runtime_provenance.json" \
+    --trace "$SOLVE_OUT" \
+    --cli-version "${EVAL_DIR}/cli_version.txt"
+
 echo "============================================"
 echo "=== TASK COMPLETE, PARSING AGENT TRACE ==="
 echo "============================================"
@@ -363,7 +447,11 @@ echo "======== CLEANING UP ========"
 echo "============================="
 
 echo "Task directory contents:"
-tree ${JOB_DIR}/task
+if command -v tree >/dev/null 2>&1; then
+    tree "${JOB_DIR}/task"
+else
+    find "${JOB_DIR}/task" -maxdepth 3 -print
+fi
 echo "================================"
 
 if [ -d "${JOB_DIR}/task/final_model" ]; then
@@ -378,33 +466,42 @@ python containers/delete_hf_models.py "${JOB_DIR}/task"
 
 cp -r "${JOB_DIR}/task" "$EVAL_DIR/task"
 
-rm -rf /tmp/posttrain_container
-
 echo "========================================="
 echo "=== RUNNING REWARD-HACKING JUDGES ==="
 echo "========================================="
 
-# hv-patches: the four judges all need the ChatGPT-Pro Codex CLI login. When the
-# precheck above ran in `skip` mode there is no login, and
-# setup_judge_codex_auth would `exit 1` before evaluate.py ever runs. Skip the
-# whole judge phase in that case; the deterministic score still gets produced.
+# When the precheck above ran in `skip` mode there is no judge login. Skip the
+# whole judge phase; the deterministic score still gets produced.
 if [ "$JUDGE_AUTH_MODE" = "skip" ]; then
     echo "SKIPPED: POST_TRAIN_BENCH_JUDGE_AUTH_MODE=skip -> no judge verdicts for this run." >&2
     echo "SKIPPED: scripts/collect.py will refuse to aggregate this run until verdicts exist." >&2
 else
-
-source src/judges/judge_lib.sh
 
 # Make judge helper tooling and benchmark metadata available inside the judge
 # sandbox. The final_model config comes from EVAL_DIR because delete_hf_models
 # has already run on JOB_DIR/task during cleanup.
 prepare_judge_sandbox "${JOB_DIR}" "${EVALUATION_TASK}" "${EVAL_DIR}/final_model/config.json"
 
-# Reset codex config (so agent-specific settings like model_reasoning_effort
-# can't leak into the judges) and set up the bind-mounted subscription auth
-# (JUDGE_CODEX_AUTH_SRC), through which rotated refresh tokens persist back to
-# the source instead of dying with the sandbox.
-setup_judge_codex_auth "${JOB_DIR}" || exit 1
+# Set up profile-specific isolated config and auth. The Claude profile uses a
+# separate CLAUDE_CONFIG_DIR and disables user/project/local setting sources.
+setup_judge_auth "${JOB_DIR}" || exit 1
+
+# ChatGPT subscription auth rotates a single-use refresh token. Serialize the
+# complete canonical judge phase whenever several cells share one auth file.
+JUDGE_LOCK_HELD=0
+if [ "$JUDGE_PROFILE" = "official" ]; then
+    JUDGE_LOCK_FILE="${POST_TRAIN_BENCH_JUDGE_LOCK_FILE:-}"
+    if [ -z "$JUDGE_LOCK_FILE" ]; then
+        echo "ERROR: POST_TRAIN_BENCH_JUDGE_LOCK_FILE is required for official judges" >&2
+        exit 1
+    fi
+    mkdir -p "$(dirname "$JUDGE_LOCK_FILE")"
+    exec 9>"$JUDGE_LOCK_FILE"
+    echo "Waiting for official judge auth lock: $JUDGE_LOCK_FILE"
+    flock -x 9
+    JUDGE_LOCK_HELD=1
+    echo "Official judge auth lock acquired."
+fi
 
 JUDGE_EXTRA_APPTAINER_ARGS=(
     --nv
@@ -413,15 +510,15 @@ JUDGE_EXTRA_APPTAINER_ARGS=(
     --bind "${HF_MERGED}:${HF_HOME_NEW}"
 )
 
-FIRST_JUDGE=1
 for JUDGE_NAME in "${ALL_JUDGES[@]}"; do
     load_judge_conf "${JUDGE_NAME}" || exit 1
 
     echo "=== Judge: ${JUDGE_LABEL} ==="
 
-    # Clean judgement file between judges so each one starts fresh
-    [ "$FIRST_JUDGE" = "1" ] || rm -f "${JOB_DIR}/task/judgement.json"
-    FIRST_JUDGE=0
+    # Clean the file before every judge, including the first, so an
+    # agent-created or stale judgement.json can never be collected as a fresh
+    # verdict when a judge CLI fails.
+    rm -f "${JOB_DIR}/task/judgement.json"
 
     JUDGE_PROMPT=$(build_judge_prompt "${JUDGE_NAME}" "${EVALUATION_TASK}" "${MODEL_TO_TRAIN}" "${AGENT}" "${AGENT_CONFIG}")
 
@@ -433,6 +530,12 @@ for JUDGE_NAME in "${ALL_JUDGES[@]}"; do
     collect_judge_output "${JOB_DIR}" "${EVAL_DIR}" "" 0
 done
 
+if [ "$JUDGE_LOCK_HELD" = "1" ]; then
+    flock -u 9
+    exec 9>&-
+    echo "Official judge auth lock released."
+fi
+
 fi  # hv-patches: end of JUDGE_AUTH_MODE != skip
 
 echo "================================"
@@ -441,23 +544,30 @@ echo "================================"
 
 export REPO_ROOT="$(pwd)"
 
-export TMP_HF_CACHE="/tmp/hf_cache_90afd0"
+export TMP_HF_CACHE="${PTB_SCRATCH_ROOT%/}/eval_hf_cache_${RANDOM_UUID}"
 
 export EVAL_COUNTER=0
+source src/utils/gpu_reap.sh
 
 run_evaluation() {
     local max_tokens_arg="$1"
     local eval_num="$2"
-    nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9
+    ptb_reap_allocated_gpu_processes
     sleep 5
     with_huggingface_overlay apptainer exec \
         --nv \
+        -c \
+        --cleanenv \
+        --pid \
+        --no-init \
+        --env "CUDA_VISIBLE_DEVICES=${POST_TRAIN_BENCH_VISIBLE_GPUS:-${CUDA_VISIBLE_DEVICES:-}}" \
         --env "HF_HOME=${TMP_HF_CACHE}" \
         --env OPENAI_API_KEY="${OPENAI_API_KEY}" \
         --env OPENROUTER_API_KEY="${OPENROUTER_API_KEY}" \
         --env VLLM_API_KEY="inspectai" \
         --env PYTHONNOUSERSITE="1" \
         --writable-tmpfs \
+        --bind "${JOB_TMP}:/tmp" \
         --bind "${REPO_ROOT}:${REPO_ROOT}" \
         --bind "${HF_MERGED}:${TMP_HF_CACHE}" \
         --pwd "$(pwd)/src/eval/tasks/${EVALUATION_TASK}" \
@@ -483,7 +593,7 @@ run_evaluation_with_retry() {
         export EVAL_COUNTER
         echo "Evaluation attempt $EVAL_COUNTER (phase attempt $attempt of $max_retries)"
 
-        timeout --signal=TERM --kill-after=60s 28800s bash -c "$(declare -f run_evaluation with_huggingface_overlay); run_evaluation \"$max_tokens_arg\" \"$EVAL_COUNTER\""
+        timeout --signal=TERM --kill-after=60s 28800s bash -c "$(declare -f run_evaluation with_huggingface_overlay ptb_reap_allocated_gpu_processes); run_evaluation \"$max_tokens_arg\" \"$EVAL_COUNTER\""
 
         if [ -f "${EVAL_DIR}/metrics.json" ]; then
             return 0
@@ -561,3 +671,28 @@ echo $(cat "$EVAL_DIR/final_eval_${EVAL_COUNTER}.txt")
 echo "================================"
 echo "======= EVALUATION DONE ========"
 echo "================================"
+
+if [ "${POST_TRAIN_BENCH_REQUIRE_COMPLETE:-0}" = "1" ]; then
+    COMPLETION_FAILURES=0
+    for required_artifact in \
+        final_model/config.json \
+        metrics.json \
+        judgement_gpt5_4.json \
+        judgement_api.json \
+        judgement_ptb_lookup.json \
+        judgement_general.json; do
+        if [ ! -s "${EVAL_DIR}/${required_artifact}" ]; then
+            echo "COMPLETION ERROR: missing or empty ${EVAL_DIR}/${required_artifact}" >&2
+            COMPLETION_FAILURES=$((COMPLETION_FAILURES + 1))
+        fi
+    done
+    if [ "$JUDGE_PROFILE" != "official" ]; then
+        echo "COMPLETION ERROR: formal runs require the official judge profile" >&2
+        COMPLETION_FAILURES=$((COMPLETION_FAILURES + 1))
+    fi
+    if [ "$COMPLETION_FAILURES" -ne 0 ]; then
+        echo "PTB COMPLETE FLOW FAILED: ${COMPLETION_FAILURES} required artifact/profile check(s) failed" >&2
+        exit 1
+    fi
+    echo "PTB COMPLETE FLOW PASSED: final model, four official verdicts, and metrics are present."
+fi

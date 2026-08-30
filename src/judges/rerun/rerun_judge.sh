@@ -19,11 +19,13 @@
 # files produced during the original run_task.sh are preserved.
 #
 # Usage:
-#   rerun_judge.sh --judge <judge_name> [--dry-run] [--skip-existing] <dir> [<dir>...]
+#   rerun_judge.sh --judge <judge_name> [--profile official|claude]
+#                  [--dry-run] [--skip-existing] <dir> [<dir>...]
 #
 # Options:
 #   --judge          Judge to rerun (directory name under src/judges/, e.g.
 #                    ptb_lookup_judge, general_judge). Required.
+#   --profile        Runtime/output profile (default: official).
 #   --dry-run        Print the result dirs that would be submitted, but do not
 #                    call condor_submit_bid.
 #   --skip-existing  Skip result dirs that already have
@@ -39,12 +41,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 SUB_FILE="src/judges/rerun/rerun_judges.sub"
 
 JUDGE=""
+PROFILE="official"
 DRY_RUN=""
 SKIP_EXISTING=""
 INPUT_DIRS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --judge) JUDGE="$2"; shift 2 ;;
+        --profile) PROFILE="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --skip-existing) SKIP_EXISTING=1; shift ;;
         -*) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -53,16 +57,18 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$JUDGE" ] || [ ${#INPUT_DIRS[@]} -eq 0 ]; then
-    echo "Usage: $0 --judge <judge_name> [--dry-run] [--skip-existing] <method_dir_or_result_dir>..." >&2
+    echo "Usage: $0 --judge <judge_name> [--profile official|claude] [--dry-run] [--skip-existing] <method_dir_or_result_dir>..." >&2
     exit 1
 fi
+case "$PROFILE" in official|claude) ;; *) echo "ERROR: --profile must be official or claude" >&2; exit 1 ;; esac
 
 # Validates the judge name (errors on an unknown judge) and sets JUDGE_OUTPUT_ID.
 source "$SCRIPT_DIR/../judge_lib.sh"
+export POST_TRAIN_BENCH_JUDGE_PROFILE="$PROFILE"
 load_judge_conf "$JUDGE"
 OUTPUT_ID="$JUDGE_OUTPUT_ID"
 
-echo "Judge: $JUDGE (output id: $OUTPUT_ID)"
+echo "Judge: $JUDGE (profile: $PROFILE, output id: $OUTPUT_ID)"
 
 # Expand method dirs into task result dirs; pass single result dirs through.
 # Within a method dir, keep only the latest run per benchmark+model: dirs are
@@ -165,6 +171,7 @@ for result_dir in "${RESULT_DIRS[@]}"; do
     SUBMIT_OUT="$(condor_submit_bid 100 \
         -a "result_dir=$result_dir" \
         -a "judges=$JUDGE" \
+        -a "profile=$PROFILE" \
         "$SUB_FILE" 2>&1)"
     echo "$SUBMIT_OUT" | tail -1
     CLUSTER_ID="$(echo "$SUBMIT_OUT" | grep -oE 'cluster [0-9]+' | awk '{print $2}' | tail -1)"

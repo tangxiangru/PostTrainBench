@@ -1,5 +1,5 @@
 _SET_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${_SET_ENV_DIR}/../../.env"
+ENV_FILE="${POST_TRAIN_BENCH_ENV_FILE:-${_SET_ENV_DIR}/../../.env}"
 
 if [ ! -f "$ENV_FILE" ]; then
     echo "ERROR: .env file not found at $ENV_FILE" >&2

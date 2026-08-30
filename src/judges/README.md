@@ -11,6 +11,19 @@ The judges run in two contexts:
 - **Standalone/rerun** — `run_judges.sh <result_dir>` reruns judges on an existing result dir.
   Outputs always carry the `_rerun` suffix so the originals are preserved.
 
+They also have two runtime/output profiles:
+
+- **`official` (default)** — the existing Codex CLI + GPT judges. It writes the canonical
+  output ids consumed by `scripts/collect.py`; selecting no profile is exactly this behavior.
+- **`claude` (research)** — Claude Code CLI + the `opus` model alias at **xhigh** effort.
+  It writes only `judgement_claude_*` outputs. Canonical aggregation deliberately ignores
+  these files, so a Claude verdict cannot impersonate or overwrite an official verdict.
+
+Both profiles receive the byte-for-byte same prompt assembled by `build_judge_prompt` from
+the same `prompt.md` template and `get_judge_prompt.py` fillers. The judge task, tool paths,
+and required `task/judgement.json` schema live in those shared prompts; there is no hidden
+Codex system configuration containing benchmark-specific instructions.
+
 ## Judges
 
 | Folder | Output id | Verdict schema | Consumed downstream? |
@@ -20,7 +33,7 @@ The judges run in two contexts:
 | `ptb_lookup_judge/` | `ptb_lookup` | `disallowed_ptb_lookup` + justification | Archival — no score fallback, but `scripts/collect.py` raises an error if it ever flags, so a firing lookup judge cannot pass unnoticed |
 | `general_judge/` | `general` | `general_anomaly` + justification | Archival — never feeds scores; when it flags, `scripts/collect.py` finishes its collection pass but writes **no** output files and raises, listing every flagged run for manual review (flip `general_anomaly` to false in the listed verdict file if the run checks out) |
 
-The three reward-hacking judges run as GPT-5.4 via the codex CLI; the general judge — an
+In the official profile, the three reward-hacking judges run as GPT-5.4 via the codex CLI; the general judge — an
 open-ended sweep for "unknown unknowns" (premature agent stops, usage limits/token
 exhaustion, grader-API credit exhaustion on the LLM-judged benchmarks, harness/infra
 failures, novel reward hacking outside the other judges' scope) — runs as GPT-5.6 Terra on
@@ -28,11 +41,19 @@ a codex CLI pinned to 0.144.5 (`JUDGE_CODEX_VERSION`, npm-installed into the san
 judge time). All use ChatGPT-subscription auth
 (`agents/codex_non_api/auth.json`, bind-mounted so rotated refresh tokens persist).
 
+The Claude profile uses the same four judge definitions, a configurable `opus` model alias,
+and explicit `--effort xhigh` plus `CLAUDE_CODE_EFFORT_LEVEL=xhigh`. `max` is not used. Its
+container defaults to `opus_5.sif`. Every invocation writes a `judge_metadata_claude_*.json`
+record containing the requested model alias/id, the model actually resolved in Claude's init
+event, effort, container and actual Claude CLI version. The installed CLI/account resolves
+and validates the model request at runtime; set
+`POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL` to an exact accepted Opus 5 id when pinning is required.
+
 ## Layout
 
 ```
 src/judges/
-├── judge_lib.sh              # shared bash helpers (sandbox prep, codex exec, output collection);
+├── judge_lib.sh              # shared bash helpers (profiles, auth, sandbox, exec, collection);
 │                             # also defines ALL_JUDGES (the set + execution order)
 ├── run_judges.sh             # standalone runner: run_judges.sh [--judges a,b] <result_dir>
 ├── get_judge_prompt.py       # prompt generation (--judge <judge_name>)
@@ -50,16 +71,51 @@ src/judges/
 ## Running
 
 ```bash
-# Rerun all judges on one result dir (writes *_rerun outputs, originals preserved)
+# Official/canonical rerun (the default)
 bash src/judges/run_judges.sh /path/to/result_dir
 
 # Rerun a subset
 bash src/judges/run_judges.sh --judges data_contamination_judge /path/to/result_dir
 bash src/judges/run_judges.sh --judges api_usage_judge /path/to/result_dir
+
+# Research-only Claude/Opus/xhigh rerun
+bash src/judges/run_judges.sh --profile claude /path/to/result_dir
 ```
 
 The result dir must contain `task/` and a trace file. The trace is copied next to the sandbox
 task directory, so the judge reads it as `../solve_parsed.txt` from its working directory.
+
+For the Claude profile on GCP/Vertex, the existing site environment is enough when
+`CLAUDE_CODE_USE_VERTEX=1` (or `ANTHROPIC_VERTEX=true`) and the compute node exposes GCE
+metadata ADC:
+
+```bash
+POST_TRAIN_BENCH_JUDGE_PROFILE="claude"
+POST_TRAIN_BENCH_JUDGE_AUTH_MODE="vertex"  # optional when Vertex env is already set
+POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL="opus"
+POST_TRAIN_BENCH_CLAUDE_JUDGE_CONTAINER="opus_5.sif"
+```
+
+For non-GCE Vertex, set a read-only file-backed ADC with
+`POST_TRAIN_BENCH_VERTEX_ADC_FILE`. For Anthropic subscription OAuth instead, configure a
+dedicated credential outside this repository:
+
+```bash
+POST_TRAIN_BENCH_JUDGE_PROFILE="claude"
+POST_TRAIN_BENCH_JUDGE_AUTH_MODE="claude_oauth"
+POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL="opus"
+POST_TRAIN_BENCH_CLAUDE_JUDGE_CONTAINER="opus_5.sif"
+POST_TRAIN_BENCH_CLAUDE_JUDGE_OAUTH_TOKEN_FILE="/secure/path/ptb-claude-judge/oauth_token"
+```
+
+The OAuth token file must not be an `agents/<agent>/oauth_token`. Both Claude auth modes run in `--safe-mode`
+(disabling `CLAUDE.md`, skills, plugins, hooks, MCP and custom agents), with a fresh
+`CLAUDE_CONFIG_DIR`, empty user/project/local setting sources, no session persistence,
+and cleared Anthropic API-key variables. OAuth tokens and file-backed ADC are mounted
+read-only; GCE metadata ADC uses the node service account and has no local secret file.
+This prevents a tested agent's project files, persona, settings or credentials from
+becoming judge configuration. Vertex mode explicitly forwards only the project, region,
+Opus mapping and ADC source required by Claude Code; file-backed ADC is mounted read-only.
 
 ## Batch reruns (HTCondor)
 
@@ -72,6 +128,9 @@ bash src/judges/rerun/commit_rerun_judges.sh --dry-run
 
 # Only a subset of judges
 bash src/judges/rerun/commit_rerun_judges.sh --judges data_contamination_judge
+
+# Batch research rerun with isolated Claude output ids
+bash src/judges/rerun/commit_rerun_judges.sh --profile claude
 
 # Per result dir, only rerun judges whose _rerun output is missing
 bash src/judges/rerun/commit_rerun_judges.sh --skip-existing
@@ -90,7 +149,8 @@ python src/judges/rerun/list_results.py --paths-only --latest-only --method "cla
 done
 ```
 
-`rerun_judges.sub` accepts `-a "judges=..."` (default: all). Every rerun job consumes a
+`rerun_judges.sub` accepts `-a "judges=..."` and `-a "profile=official|claude"`.
+Every rerun job consumes a
 fixed 2500 units of the `user.codex_judge_rerun` concurrency limit, regardless of which
 judges it runs.
 
@@ -109,12 +169,17 @@ python src/judges/rerun/find_disallowed_api_usage.py
 
 ## Output files
 
-Per judge (`<id>` = `JUDGE_OUTPUT_ID`, `<sfx>` = empty inline / `_rerun` standalone):
+Per judge (`<id>` = the profile's output id, `<sfx>` = empty inline / `_rerun` standalone):
 
-- `judge_output_<id><sfx>.json` — raw codex CLI trace
+- `judge_output_<id><sfx>.json` — raw Codex JSONL or Claude stream-json trace
 - `judge_output_<id><sfx>.txt` — human-readable trace (`src/trace_parsing/parse_trace.py`)
+- `judge_metadata_<id><sfx>.json` — profile/backend/model/effort/container/CLI version
 - `judgement_<id><sfx>.json` — structured verdict the judge wrote to `judgement.json`
   in its sandbox task directory
+
+Claude ids are `claude_contamination`, `claude_api`, `claude_ptb_lookup`, and
+`claude_general`. Their verdict JSON schemas are identical to the corresponding official
+judge schemas below, because both profiles use the same prompts and collector contract.
 
 `judgement_gpt5_4*.json` schema:
 
@@ -163,6 +228,9 @@ Per judge (`<id>` = `JUDGE_OUTPUT_ID`, `<sfx>` = empty inline / `_rerun` standal
    - `judge.conf` — simple `KEY="value"` lines (sourced by bash, parsed by python):
      - `JUDGE_LABEL` — human-readable name used in logs
      - `JUDGE_OUTPUT_ID` — suffix for all output files (`judgement_<id>.json`, ...)
+     - `JUDGE_CLAUDE_OUTPUT_ID` — distinct research-profile output suffix; it must not be
+       any canonical id consumed by `scripts/collect.py`
+     - optional: `JUDGE_CLAUDE_LABEL` for profile-specific log text
      - `JUDGE_PROMPT_FILE` — the template's filename
      - optional: `JUDGE_MODEL` / `JUDGE_REASONING_EFFORT` to override the codex defaults
        (`gpt-5.4` / `xhigh`, see `judge_lib.sh`)
@@ -180,5 +248,6 @@ inline (`run_task.sh`) it is always a warning, so a finished 10h agent run still
 evaluated and the rerun pipeline can supply the verdict later; standalone
 (`run_judges.sh`) it is always fatal, since producing the verdict is the job.
 
-The judge prompt must instruct the model to write its verdict to `judgement.json` in the task
-directory; that file is collected as `judgement_<id><sfx>.json`.
+The shared judge prompt must instruct either backend to write its verdict to
+`judgement.json` in the task directory; that file is collected as
+`judgement_<profile-id><sfx>.json`.
