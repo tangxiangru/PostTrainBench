@@ -491,3 +491,65 @@ against. And 0.1198 is itself a temperature-1.0 number — the one greedy measur
 untrained model is 0.2667 — so under a fixed decode the floor rises and the 48% gets worse,
 not better. That is the single largest fact on this board, and it is not a tuning problem:
 a run that ships something worse than its own starting point had no gate stopping it.
+
+# The arm aimed at that, built 2026-08-30
+
+`claude_autor_rt` against `claude_autor_rc`. Built but **not submitted**: six PTB jobs are
+already pending behind eleven `airsgpu` jobs holding the `robtang-a3` reservation.
+
+## What it changes
+
+AutoR `ea95d15` ([#499](https://github.com/tangxiangru/AutoR/pull/499),
+`src/ptb_ratchet.py`). One mechanism, aimed at the 48% and at the finding two sections up
+that the deeper the walk goes the worse the score:
+
+* **Restore, no numbers needed.** `final_model/` is hardlinked into a snapshot at every
+  stage boundary, with a per-file `(path, size, mtime)` manifest. If what ships does not
+  load, the newest snapshot that still matches its manifest is put back. A hardlink
+  survives the unlink-and-rename `save_pretrained` does, but not a truncating write; the
+  manifest tells those apart, and a snapshot that changed is dropped rather than repaired.
+* **Promote, numbers needed and comparability required.** A checkpoint declares its own
+  score in `AUTOR_CANDIDATE.json` **inside** the directory. Snapshots are partitioned by
+  `(limit, measured decode)` and maximised only within a partition, so a candidate scored
+  on 200 items is never compared against one scored on 1,319 and a greedy measurement is
+  never compared against a temperature-1.0 one — which is exactly the confound the two
+  sections above are about. The bar is `max(0.005, sqrt(2·p·(1−p)/n))`, ≈1.8 pp at n=1319.
+
+`measured_decode` (declared) and `shipping_decode` (the checkpoint's own
+`generation_config.json`) are tracked separately. A disagreement blocks promotion — the
+number does not describe what would ship — but not restore.
+
+## Why the pair is a controlled one
+
+The `fd`/`fx` pair had byte-identical `solve.sh` files and differed by a **payload sha**,
+so it also carried whatever else landed between the two builds. This pair does not:
+
+```
+$ diff agents/claude_autor_{rt,rc}/solve.sh
+43c43
+< AUTOR_EXTRA_FLAGS=(--ratchet)
+---
+> AUTOR_EXTRA_FLAGS=()
+$ git -C agents/claude_autor_rt/payload rev-parse HEAD   # ea95d157... , both arms
+```
+
+Payload trees hash identically outside `.git`; `api_keys.json` is `{"allowed_api_keys": []}`
+on both; `--check` reports no problems on either, and reports one if the flag is misspelled,
+which would otherwise be an `unrecognized arguments` exit ten hours into a queue.
+
+## What it is not
+
+Half of the mechanism is enforced in code and needs nothing from the agent: the export-time
+ratchet. The other half — bank a real checkpoint in the first 45% of the budget — is a
+directive that appears in the prompt once that deadline passes with nothing banked, and
+repeats until it is met. It is not a gate. **An agent that trains nothing for ten hours
+still ships nothing**, by design: the ratchet only ever re-selects among checkpoints the
+agent saved to `final_model/` itself.
+
+## What the arm can and cannot show
+
+It can show whether the *lower half* of the board comes up: the prediction is a rise in the
+"above 0.1198" count, not a rise in the best cell. It cannot show that on n=1 per arm —
+the decode census above spreads cells of one arm from 0.0485 to 0.4284, so a single-seed
+contrast here sits well inside its own noise. Six cells per arm is the minimum worth
+reading, and the comparison to make is the count above the floor, not the mean.
