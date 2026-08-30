@@ -83,10 +83,33 @@ HF_CACHE_ENV=(
     --env HUGGINGFACE_HUB_CACHE="${TMP_HF_CACHE}/hub"
 )
 
+# The hub is not the only cache this host redirects. It points seven variables at
+# one root -- UV_CACHE_DIR, PIP_CACHE_DIR, TRITON_CACHE_DIR, XDG_CACHE_HOME,
+# HF_HOME, HUGGINGFACE_HUB_CACHE, TORCH_HOME -- and XDG_CACHE_HOME is the one that
+# matters most, because it is where anything without a variable of its own lands:
+# vLLM's VLLM_CACHE_ROOT defaults to "$XDG_CACHE_HOME/vllm", which is how
+# vllm/modelinfos/ ends up there. None of that root is bound in, so each write goes
+# to the 64 MiB container root and fails -- first as "Error saving model info cache"
+# (survivable), then inside triton's kernel cache as
+# torch._inductor.exc.InductorError: OSError: [Errno 28], which kills EngineCore
+# and takes the vLLM server with it.
+#
+# One bind covers all seven, and the next library's variable too, which naming them
+# individually would not. Binding it through rather than redirecting it also keeps
+# the compiled triton kernels across runs; the alternative costs a recompile per
+# evaluation, and there are up to nine per job. The HF cache is deliberately not
+# reached this way -- the three variables above still point at the overlay, so the
+# scorer cannot write into the shared hub.
+CACHE_BIND=()
+if [ -n "${XDG_CACHE_HOME:-}" ] && [ -d "${XDG_CACHE_HOME}" ]; then
+    CACHE_BIND=(--bind "${XDG_CACHE_HOME}:${XDG_CACHE_HOME}")
+fi
+
 check_cuda() {
     apptainer exec \
         --nv \
         "${HF_CACHE_ENV[@]}" \
+        "${CACHE_BIND[@]}" \
         --writable-tmpfs \
         --bind "${REPO_ROOT}:${REPO_ROOT}" \
         --bind "${HF_MERGED}:${TMP_HF_CACHE}" \
@@ -98,6 +121,7 @@ run_eval() {
     apptainer exec \
         --nv \
         "${HF_CACHE_ENV[@]}" \
+        "${CACHE_BIND[@]}" \
         --env OPENAI_API_KEY="${OPENAI_API_KEY:-}" \
         --env VLLM_API_KEY="inspectai" \
         --env VLLM_LOGGING_LEVEL="DEBUG" \
