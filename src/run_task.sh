@@ -99,7 +99,23 @@ fi
 cp -r "containers/other_home_data/.codex" "${JOB_DIR}/"
 
 BENCHMARK=$(cat src/eval/tasks/${EVALUATION_TASK}/benchmark.txt)
-PROMPT=$(python src/eval/general/get_prompt.py --model-to-train "$MODEL_TO_TRAIN" --benchmark-id "$EVALUATION_TASK" --num-hours "$NUM_HOURS" --num-gpus "$NUM_GPUS" --agent "${AGENT}")
+BASE_MODEL_REVISION="${POST_TRAIN_BENCH_BASE_MODEL_REVISION:-}"
+BASE_MODEL_CACHE_KEY="models--${MODEL_TO_TRAIN//\//--}"
+BASE_MODEL_SNAPSHOT_CONTAINER="${HF_HOME_NEW}/hub/${BASE_MODEL_CACHE_KEY}/snapshots/${BASE_MODEL_REVISION}"
+PROMPT_ARGS=(
+    --model-to-train "$MODEL_TO_TRAIN"
+    --benchmark-id "$EVALUATION_TASK"
+    --num-hours "$NUM_HOURS"
+    --num-gpus "$NUM_GPUS"
+    --agent "${AGENT}"
+)
+if [ -n "$BASE_MODEL_REVISION" ]; then
+    PROMPT_ARGS+=(
+        --model-revision "$BASE_MODEL_REVISION"
+        --model-snapshot "$BASE_MODEL_SNAPSHOT_CONTAINER"
+    )
+fi
+PROMPT=$(python src/eval/general/get_prompt.py "${PROMPT_ARGS[@]}")
 echo "$PROMPT" > "${EVAL_DIR}/prompt.txt"
 
 bash src/utils/create_timer.sh $NUM_HOURS $JOB_DIR/task/timer.sh
@@ -296,6 +312,9 @@ solve_task() {
         --env NUM_GPUS="${NUM_GPUS}" \
         --env PROMPT="${PROMPT}" \
         --env AGENT_CONFIG="${AGENT_CONFIG}" \
+        --env PTB_BASE_MODEL_ID="${MODEL_TO_TRAIN}" \
+        --env PTB_BASE_MODEL_REVISION="${BASE_MODEL_REVISION}" \
+        --env PTB_BASE_MODEL_SNAPSHOT="${BASE_MODEL_SNAPSHOT_CONTAINER}" \
         "${AGENT_ENV_ARGS[@]}" \
         "${VISIBLE_GPUS_ENV[@]}" \
         "${CLI_UPDATE_ENV[@]}" \
@@ -673,26 +692,6 @@ echo "======= EVALUATION DONE ========"
 echo "================================"
 
 if [ "${POST_TRAIN_BENCH_REQUIRE_COMPLETE:-0}" = "1" ]; then
-    COMPLETION_FAILURES=0
-    for required_artifact in \
-        final_model/config.json \
-        metrics.json \
-        judgement_gpt5_4.json \
-        judgement_api.json \
-        judgement_ptb_lookup.json \
-        judgement_general.json; do
-        if [ ! -s "${EVAL_DIR}/${required_artifact}" ]; then
-            echo "COMPLETION ERROR: missing or empty ${EVAL_DIR}/${required_artifact}" >&2
-            COMPLETION_FAILURES=$((COMPLETION_FAILURES + 1))
-        fi
-    done
-    if [ "$JUDGE_PROFILE" != "official" ]; then
-        echo "COMPLETION ERROR: formal runs require the official judge profile" >&2
-        COMPLETION_FAILURES=$((COMPLETION_FAILURES + 1))
-    fi
-    if [ "$COMPLETION_FAILURES" -ne 0 ]; then
-        echo "PTB COMPLETE FLOW FAILED: ${COMPLETION_FAILURES} required artifact/profile check(s) failed" >&2
-        exit 1
-    fi
-    echo "PTB COMPLETE FLOW PASSED: final model, four official verdicts, and metrics are present."
+    python3 src/utils/validate_completed_run.py \
+        "$EVAL_DIR" --judge-profile "$JUDGE_PROFILE"
 fi

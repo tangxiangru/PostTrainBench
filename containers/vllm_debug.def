@@ -61,6 +61,7 @@ From: nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
     cd /opt
     git clone https://github.com/rank-and-file/inspect_ai_vllm_stdout.git
     cd inspect_ai_vllm_stdout
+    git checkout 64db0afdd3796732b232954ef440c66ed22923a7
     uv pip install --system --no-cache .
     
 %environment

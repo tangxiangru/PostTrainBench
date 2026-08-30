@@ -1,4 +1,5 @@
 We want to train the small LLM \`{model}\` to excel at {benchmark}.
+{model_revision_note}
 Your goal is to implement an effective approach through systematic research and experimentation.
 
 ## Objective

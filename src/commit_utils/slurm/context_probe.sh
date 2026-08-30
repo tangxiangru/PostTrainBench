@@ -75,6 +75,18 @@ verified = (
     and resolved_context >= requested_context
 )
 raw_bytes = Path(raw_path).read_bytes()
+image_path = Path(image)
+image_digest = hashlib.sha256()
+with image_path.open("rb") as stream:
+    while chunk := stream.read(8 * 1024 * 1024):
+        image_digest.update(chunk)
+actual_image_sha256 = image_digest.hexdigest()
+expected_image_sha256 = os.environ.get("POST_TRAIN_BENCH_CONTAINER_SHA256", "")
+if expected_image_sha256 and actual_image_sha256 != expected_image_sha256:
+    raise SystemExit(
+        f"context probe container digest mismatch: actual={actual_image_sha256} "
+        f"expected={expected_image_sha256}"
+    )
 record = {
     "schema_version": 1,
     "verified": verified,
@@ -86,8 +98,8 @@ record = {
     "node": os.environ.get("SLURMD_NODENAME"),
     "gpu_ids": os.environ.get("SLURM_JOB_GPUS"),
     "cli_version": init.get("claude_code_version", "unknown"),
-    "container": Path(image).name,
-    "container_sha256": os.environ.get("POST_TRAIN_BENCH_CONTAINER_SHA256"),
+    "container": image_path.name,
+    "container_sha256": actual_image_sha256,
     "requested_model": requested_model,
     "resolved_model": model_key or init.get("model", "unknown"),
     "canonical_model": model_usage.get("canonicalModel"),

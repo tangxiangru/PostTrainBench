@@ -2,14 +2,15 @@
 
 set -uo pipefail
 
-if [ "$#" -ne 3 ]; then
-    echo "Usage: $0 <num-gpus> <eval> <agent>" >&2
+if [ "$#" -ne 4 ]; then
+    echo "Usage: $0 <num-gpus> <eval> <agent> <base-model>" >&2
     exit 2
 fi
 
 NUM_GPUS="$1"
 EVALUATION_TASK="$2"
 AGENT="$3"
+MODEL_TO_TRAIN="$4"
 FAILURES=0
 
 fail() {
@@ -97,6 +98,22 @@ if [ ! -d "${HF_HOME:-}" ] || [ ! -r "${HF_HOME:-}" ]; then
     fail "HF_HOME is missing or unreadable: ${HF_HOME:-<unset>}"
 else
     ok "HF_HOME=${HF_HOME}"
+fi
+
+BASE_MODEL_REVISION="${POST_TRAIN_BENCH_BASE_MODEL_REVISION:-}"
+if [ -n "$BASE_MODEL_REVISION" ]; then
+    if ! [[ "$BASE_MODEL_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+        fail "POST_TRAIN_BENCH_BASE_MODEL_REVISION must be a 40-character commit"
+    else
+        BASE_MODEL_CACHE_KEY="models--${MODEL_TO_TRAIN//\//--}"
+        BASE_MODEL_SNAPSHOT="${HF_HOME}/hub/${BASE_MODEL_CACHE_KEY}/snapshots/${BASE_MODEL_REVISION}"
+        if python3 src/utils/validate_model_snapshot.py "$BASE_MODEL_SNAPSHOT"
+        then
+            ok "base model=${MODEL_TO_TRAIN}@${BASE_MODEL_REVISION} snapshot=${BASE_MODEL_SNAPSHOT}"
+        else
+            fail "pinned base-model snapshot is missing or incomplete: ${MODEL_TO_TRAIN}@${BASE_MODEL_REVISION}"
+        fi
+    fi
 fi
 
 if [ -z "${POST_TRAIN_BENCH_RESULTS_DIR:-}" ]; then

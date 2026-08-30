@@ -34,6 +34,8 @@ if [ ! -r "${REPO_ROOT}/src/run_task.sh" ]; then
 fi
 cd "$REPO_ROOT"
 
+SUBMISSION_REPO_ROOT="$REPO_ROOT"
+
 source src/commit_utils/set_env_vars.sh
 
 if [ "${POST_TRAIN_BENCH_JOB_SCHEDULER:-}" != "slurm" ]; then
@@ -93,6 +95,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
+FROZEN_PTB_COMMIT="${POST_TRAIN_BENCH_FROZEN_PTB_COMMIT:-}"
+if [ -n "$FROZEN_PTB_COMMIT" ]; then
+    if ! [[ "$FROZEN_PTB_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "ERROR: invalid POST_TRAIN_BENCH_FROZEN_PTB_COMMIT=$FROZEN_PTB_COMMIT" >&2
+        exit 1
+    fi
+    command -v git >/dev/null || { echo "ERROR: git is required to materialize frozen source" >&2; exit 1; }
+    command -v tar >/dev/null || { echo "ERROR: tar is required to materialize frozen source" >&2; exit 1; }
+    git -C "$SUBMISSION_REPO_ROOT" cat-file -e "${FROZEN_PTB_COMMIT}^{commit}" \
+        || { echo "ERROR: frozen PTB commit is unavailable: $FROZEN_PTB_COMMIT" >&2; exit 1; }
+    FROZEN_SOURCE="$JOB_SCRATCH/source"
+    mkdir -p "$FROZEN_SOURCE"
+    git -C "$SUBMISSION_REPO_ROOT" archive "$FROZEN_PTB_COMMIT" | tar -x -C "$FROZEN_SOURCE"
+    export POST_TRAIN_BENCH_ENV_FILE="${POST_TRAIN_BENCH_ENV_FILE:-${SUBMISSION_REPO_ROOT}/.env}"
+    export POST_TRAIN_BENCH_REPO_ROOT="$FROZEN_SOURCE"
+    REPO_ROOT="$FROZEN_SOURCE"
+    cd "$REPO_ROOT"
+    echo "Frozen PTB source: ${FROZEN_PTB_COMMIT} -> ${FROZEN_SOURCE}"
+fi
+
 GPU_MODE="${POST_TRAIN_BENCH_SLURM_GPU_MODE:-gres}"
 case "$GPU_MODE" in
     gres)
@@ -124,7 +146,7 @@ echo "Node: ${SLURMD_NODENAME:-$(hostname)}"
 echo "GPU mode: ${GPU_MODE}; CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "Scratch: ${JOB_SCRATCH}"
 
-bash src/commit_utils/slurm/preflight.sh "$NUM_GPUS" "$EVALUATION_TASK" "$AGENT"
+bash src/commit_utils/slurm/preflight.sh "$NUM_GPUS" "$EVALUATION_TASK" "$AGENT" "$MODEL_TO_TRAIN"
 
 if [ "${POST_TRAIN_BENCH_SLURM_PREFLIGHT_ONLY:-0}" = "1" ]; then
     echo "Preflight-only Slurm job completed successfully."

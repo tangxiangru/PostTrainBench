@@ -20,6 +20,7 @@ Options:
   --walltime <slurm-time>   Override computed Slurm walltime
   --preflight-only          Check the selected node without running PTB
   --runtime-smoke           Run a short GPU check in the configured SIF
+  --hold                    Submit the job held; release it with scontrol
   --dry-run                 Print the sbatch command without submitting
   -h, --help                Show this help
 EOF
@@ -37,6 +38,7 @@ WALLTIME=""
 PREFLIGHT_ONLY=0
 RUNTIME_SMOKE=0
 DRY_RUN=0
+HOLD=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -51,6 +53,7 @@ while [ "$#" -gt 0 ]; do
         --walltime) WALLTIME="${2:?missing value for --walltime}"; shift 2 ;;
         --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --runtime-smoke) RUNTIME_SMOKE=1; shift ;;
+        --hold) HOLD=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -132,6 +135,10 @@ SBATCH_ARGS=(
     --output="${REPO_ROOT}/logs/slurm/%x-%j.out"
     --error="${REPO_ROOT}/logs/slurm/%x-%j.err"
 )
+
+if [ "$HOLD" = "1" ]; then
+    SBATCH_ARGS+=(--hold)
+fi
 
 if [ -n "${POST_TRAIN_BENCH_SLURM_NODELIST:-}" ]; then
     SBATCH_ARGS+=(--nodelist="$POST_TRAIN_BENCH_SLURM_NODELIST")

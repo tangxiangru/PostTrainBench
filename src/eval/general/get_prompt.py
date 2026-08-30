@@ -37,6 +37,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--agent', type=str, required=True)
     parser.add_argument('--model-to-train', type=str, required=True)
+    parser.add_argument('--model-revision', type=str, default='')
+    parser.add_argument('--model-snapshot', type=str, default='')
     parser.add_argument('--benchmark-id', type=str, required=True)
     parser.add_argument('--num-hours', type=str, required=True)
     parser.add_argument('--num-gpus', type=int, default=1)
@@ -60,6 +62,17 @@ def main():
         gpu_info = f"- The machine is equipped with {args.num_gpus} Nvidia H100 GPUs."
 
     result = template.replace('{model}', args.model_to_train)
+    if args.model_revision:
+        if not args.model_snapshot:
+            raise ValueError('--model-snapshot is required with --model-revision')
+        revision_note = (
+            f"The immutable starting revision is \\`{args.model_revision}\\`. Its complete local "
+            f"snapshot is at \\`{args.model_snapshot}\\`; load that snapshot as the starting model "
+            "so the base weights cannot drift during this batch.\n"
+        )
+    else:
+        revision_note = ""
+    result = result.replace('{model_revision_note}', revision_note)
     result = result.replace('{benchmark}', benchmark_name)
     result = result.replace('{num_hours}', args.num_hours)
     result = result.replace('{gpu_info}', gpu_info)

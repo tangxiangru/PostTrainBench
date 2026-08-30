@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,10 +21,23 @@ def command(*args: str, cwd: Path | None = None) -> str:
         return "unknown"
 
 
-def sha256(path: Path, configured_name: str) -> str:
+def verified_sha256(path: Path, configured_name: str) -> str:
+    if not path.is_file():
+        raise SystemExit(f"container not found: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    actual = digest.hexdigest()
     configured = os.environ.get(configured_name, "")
-    if configured:
-        return configured
+    if configured and actual != configured:
+        raise SystemExit(
+            f"container digest mismatch for {path}: actual={actual}, expected={configured_name}={configured}"
+        )
+    return actual
+
+
+def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         while chunk := stream.read(8 * 1024 * 1024):
@@ -51,7 +65,16 @@ def load_context_validation(requested_model: str) -> dict[str, Any] | None:
     path = Path(record_name)
     if not path.is_file():
         raise SystemExit(f"context validation record not found: {path}")
-    data = json.loads(path.read_text(encoding="utf-8"))
+    raw = path.read_bytes()
+    actual_digest = hashlib.sha256(raw).hexdigest()
+    expected_digest = os.environ.get("POST_TRAIN_BENCH_CONTEXT_VALIDATION_SHA256", "")
+    if required and not expected_digest:
+        raise SystemExit("required context validation has no frozen SHA-256 digest")
+    if expected_digest and actual_digest != expected_digest:
+        raise SystemExit(
+            f"context validation digest mismatch: actual={actual_digest}, expected={expected_digest}"
+        )
+    data = json.loads(raw)
     if data.get("requested_model") != requested_model:
         raise SystemExit(
             f"context validation model mismatch: {data.get('requested_model')!r} != {requested_model!r}"
@@ -60,7 +83,7 @@ def load_context_validation(requested_model: str) -> dict[str, Any] | None:
         raise SystemExit("context validation must be a verified Vertex provider result")
     if int(data.get("resolved_context_tokens", 0)) < 1_000_000:
         raise SystemExit("context validation did not resolve a >=1M context window")
-    return {"path": str(path.resolve()), "record": data}
+    return {"path": str(path.resolve()), "sha256": actual_digest, "record": data}
 
 
 def init(args: argparse.Namespace) -> None:
@@ -71,10 +94,23 @@ def init(args: argparse.Namespace) -> None:
     judge_image = Path(os.environ["POST_TRAIN_BENCH_CONTAINERS_DIR"]) / os.environ.get(
         "POST_TRAIN_BENCH_OFFICIAL_JUDGE_CONTAINER", "gpt_5_5.sif"
     )
+    evaluation_image = (
+        Path(os.environ["POST_TRAIN_BENCH_CONTAINERS_DIR"]) / "vllm_debug.sif"
+    )
     top = command("git", "rev-parse", "--show-superproject-working-tree", cwd=repo)
     top_path = Path(top) if top and top != "unknown" else repo
     requested_context = os.environ.get("PTB_AGENT_REQUESTED_CONTEXT_TOKENS", "unknown")
     context_validation = load_context_validation(args.agent_config)
+    base_model_revision = os.environ.get("POST_TRAIN_BENCH_BASE_MODEL_REVISION", "")
+    base_model_cache_key = "models--" + args.base_model.replace("/", "--")
+    base_model_snapshot = (
+        Path(os.environ["HF_HOME"])
+        / "hub"
+        / base_model_cache_key
+        / "snapshots"
+        / base_model_revision
+    )
+    base_model_config = base_model_snapshot / "config.json"
     payload: dict[str, Any] = {
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -83,6 +119,7 @@ def init(args: argparse.Namespace) -> None:
             "agent": args.agent,
             "agent_config": args.agent_config,
             "base_model": args.base_model,
+            "base_model_revision": base_model_revision or "unfrozen",
             "agent_budget_hours": args.hours,
             "num_gpus": args.num_gpus,
             "experiment_name": os.environ.get("POST_TRAIN_BENCH_EXPERIMENT_NAME", ""),
@@ -102,6 +139,14 @@ def init(args: argparse.Namespace) -> None:
             "effort": os.environ.get("PTB_AGENT_EFFORT", "unknown"),
             "context_validation": context_validation,
         },
+        "base_model_cache_snapshot": {
+            "host_path": str(base_model_snapshot.resolve()),
+            "container_path": f"{os.environ.get('HF_HOME_NEW', '/home/ben/hf_cache')}/hub/"
+            f"{base_model_cache_key}/snapshots/{base_model_revision}",
+            "config_sha256": file_sha256(base_model_config)
+            if base_model_config.is_file()
+            else "missing",
+        },
         "slurm": {
             "cluster": os.environ.get("SLURM_CLUSTER_NAME"),
             "job_id": os.environ.get("SLURM_JOB_ID"),
@@ -114,18 +159,33 @@ def init(args: argparse.Namespace) -> None:
             "gpu_uuids": gpu_uuids(),
         },
         "source": {
-            "top_commit": command("git", "rev-parse", "HEAD", cwd=top_path),
-            "ptb_commit": command("git", "rev-parse", "HEAD", cwd=repo),
-            "top_dirty": command("git", "status", "--porcelain", cwd=top_path) != "",
-            "ptb_dirty": command("git", "status", "--porcelain", cwd=repo) != "",
+            "top_commit": os.environ.get("POST_TRAIN_BENCH_FROZEN_TOP_COMMIT")
+            or command("git", "rev-parse", "HEAD", cwd=top_path),
+            "ptb_commit": os.environ.get("POST_TRAIN_BENCH_FROZEN_PTB_COMMIT")
+            or command("git", "rev-parse", "HEAD", cwd=repo),
+            "top_dirty": False
+            if os.environ.get("POST_TRAIN_BENCH_FROZEN_TOP_COMMIT")
+            else command("git", "status", "--porcelain", cwd=top_path) != "",
+            "ptb_dirty": False
+            if os.environ.get("POST_TRAIN_BENCH_FROZEN_PTB_COMMIT")
+            else command("git", "status", "--porcelain", cwd=repo) != "",
+            "materialization": "git-archive"
+            if os.environ.get("POST_TRAIN_BENCH_FROZEN_PTB_COMMIT")
+            else "working-tree",
         },
         "container": {
             "path": str(image.resolve()),
-            "sha256": sha256(image, "POST_TRAIN_BENCH_CONTAINER_SHA256"),
+            "sha256": verified_sha256(image, "POST_TRAIN_BENCH_CONTAINER_SHA256"),
+        },
+        "evaluation_container": {
+            "path": str(evaluation_image.resolve()),
+            "sha256": verified_sha256(
+                evaluation_image, "POST_TRAIN_BENCH_EVALUATION_CONTAINER_SHA256"
+            ),
         },
         "official_judge_container": {
             "path": str(judge_image.resolve()),
-            "sha256": sha256(
+            "sha256": verified_sha256(
                 judge_image, "POST_TRAIN_BENCH_OFFICIAL_JUDGE_CONTAINER_SHA256"
             ),
         },
@@ -153,11 +213,20 @@ def finalize(args: argparse.Namespace) -> None:
                 if resolved_model:
                     break
     payload["agent_runtime"]["resolved_model"] = resolved_model or "unknown"
-    payload["agent_runtime"]["cli_version"] = (
+    cli_record = (
         Path(args.cli_version).read_text(encoding="utf-8", errors="replace").strip()
         if Path(args.cli_version).is_file()
-        else "unknown"
+        else ""
     )
+    version_line = next(
+        (line.removeprefix("version:").strip() for line in cli_record.splitlines() if line.startswith("version:")),
+        "",
+    )
+    version_match = re.search(r"\b\d+\.\d+\.\d+\b", version_line)
+    payload["agent_runtime"]["cli_version"] = (
+        version_match.group(0) if version_match else "unknown"
+    )
+    payload["agent_runtime"]["cli_version_record"] = cli_record or "missing"
     payload["finalized_at"] = datetime.now(timezone.utc).isoformat()
     output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
