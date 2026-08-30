@@ -8,7 +8,25 @@ NUM_HOURS="$5"
 AGENT_CONFIG="$6"
 NUM_GPUS="${7:-1}"
 
-source src/commit_utils/set_env_vars.sh
+# Both `source` lines in this file resolve against this script's own directory rather
+# than the working directory, so that a launcher may run a node-local copy of src/ while
+# leaving the working directory on the shared checkout.
+#
+# Why that matters: bash reads a script incrementally and seeks back to the byte after
+# the last command it parsed, so a long-running script holds an open handle on its own
+# inode for its whole run. Jobs 82165 and 82166 were killed by that. Both started at
+# 07:44:28 on 2026-08-30 and committing 2775447 replaced this file at 08:28:29, 44
+# minutes in; each job survived its entire agent phase and then died the moment bash
+# next needed to read -- 82165 after 10:01:47, 82166 after 08:27:27 -- with
+#
+#     src/run_task.sh: error reading input file: Stale file handle
+#
+# Nineteen H100-hours of agent work, both with a finished final_model/ on node-local
+# disk, and neither was scored. The working directory still has to be the checkout:
+# line 542 takes REPO_ROOT from `pwd` and the scoring container binds it by that path.
+_RUN_TASK_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+source "${_RUN_TASK_SRC}/commit_utils/set_env_vars.sh"
 
 # Select the judge backend for grader-based benchmarks (arenahardwriting / healthbench):
 # default to the OpenAI-backed evaluate.py, but fall back to the OpenRouter variant when
@@ -493,7 +511,7 @@ if [ -n "${POST_TRAIN_BENCH_SKIP_JUDGES:-}" ]; then
     echo "No judge_output_*.json is written; this run carries no reward-hacking verdict."
 else
 
-source src/judges/judge_lib.sh
+source "${_RUN_TASK_SRC}/judges/judge_lib.sh"
 
 # Make judge helper tooling and benchmark metadata available inside the judge
 # sandbox. The final_model config comes from EVAL_DIR because delete_hf_models

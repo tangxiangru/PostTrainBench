@@ -90,6 +90,13 @@ mkdir -p "$SCRATCH" || { echo "FATAL: cannot create $SCRATCH on $(hostname)" >&2
 [ -w "$SCRATCH" ] || { echo "FATAL: $SCRATCH is not writable on $(hostname)" >&2; exit 1; }
 echo "scratch=$SCRATCH free=$(df -h "$SCRATCH" | tail -1 | awk '{print $4}')"
 
+# Run the driver from node-local disk, because bash reads a script incrementally and a
+# `git commit` in this checkout replaces the inode under a running job. See
+# src/commit_utils/pin_src_locally.sh -- that is how 82165 and 82166 lost ten hours each.
+# One pin per job, shared by every cell: they all read it, none of them write it.
+RUN_TASK="$(bash src/commit_utils/pin_src_locally.sh "$REPO_ROOT" "${SCRATCH}/ptb-src-${SLURM_JOB_ID}")"
+echo "run_task=${RUN_TASK}"
+
 LOGDIR="/rmeng_data/robtang/PostTrainBench/slurm_logs"
 declare -a PIDS=()
 for (( gpu=0; gpu<N; gpu++ )); do
@@ -102,7 +109,7 @@ for (( gpu=0; gpu<N; gpu++ )); do
         export CUDA_VISIBLE_DEVICES="${gpu}"
         export POST_TRAIN_BENCH_VISIBLE_GPUS="${gpu}"
         echo "cell start gpu=${gpu} arm=${arm} cell=${cell} at $(date --iso-8601=seconds)"
-        bash src/run_task.sh "${TASK}" "${arm}" "${MODEL_TO_TRAIN}" "${cell}" "${NUM_HOURS}" "${AGENT_CONFIG}" 1
+        bash "${RUN_TASK}" "${TASK}" "${arm}" "${MODEL_TO_TRAIN}" "${cell}" "${NUM_HOURS}" "${AGENT_CONFIG}" 1
     ) > "${log}" 2>&1 &
     PIDS+=("$!")
     echo "launched gpu=${gpu} arm=${arm} cell=${cell} pid=${PIDS[$gpu]} log=${log}"

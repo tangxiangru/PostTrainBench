@@ -109,7 +109,7 @@ case "$MODE" in
         TASK="${1:?task}"; MODEL="${2:?model}"
         JOB_NAME="ptb-base-${TASK}"
         TIME="${PTB_TIME:-08:00:00}"
-        PAYLOAD="bash src/baselines/run_baseline.sh '${TASK}' '${MODEL}' \"\$SLURM_JOB_ID\""
+        PAYLOAD="bash \"\$PINNED_SRC/baselines/run_baseline.sh\" '${TASK}' '${MODEL}' \"\$SLURM_JOB_ID\""
         ;;
     task)
         TASK="${1:?task}"; AGENT="${2:?agent}"; MODEL="${3:?model}"
@@ -117,7 +117,7 @@ case "$MODE" in
         JOB_NAME="ptb-${AGENT}-${TASK}"
         # agent budget + 5 min of run_task.sh slack + evaluation headroom
         TIME="${PTB_TIME:-$(printf '%d:00:00' $((HOURS + 8)))}"
-        PAYLOAD="bash src/run_task.sh '${TASK}' '${AGENT}' '${MODEL}' \"\$SLURM_JOB_ID\" '${HOURS}' '${CONFIG}' 1"
+        PAYLOAD="bash \"\$RUN_TASK\" '${TASK}' '${AGENT}' '${MODEL}' \"\$SLURM_JOB_ID\" '${HOURS}' '${CONFIG}' 1"
         ;;
     rerun)
         EVAL_DIR_ARG="${1:?eval_dir}"; N="${2:-1}"
@@ -125,7 +125,7 @@ case "$MODE" in
         TIME="${PTB_TIME:-08:00:00}"
         # vllm_debug, not the configured agent image: rerun_eval_n_times.sh reads
         # POST_TRAIN_BENCH_CONTAINER_NAME for its evaluation, run_task.sh does not.
-        PAYLOAD="POST_TRAIN_BENCH_CONTAINER_NAME=vllm_debug bash scripts/rerun_eval_n_times.sh '${EVAL_DIR_ARG}' '${N}'"
+        PAYLOAD="POST_TRAIN_BENCH_CONTAINER_NAME=vllm_debug bash \"\$PINNED_ROOT/scripts/rerun_eval_n_times.sh\" '${EVAL_DIR_ARG}' '${N}'"
         ;;
     *)
         echo "unknown mode: $MODE" >&2; exit 1 ;;
@@ -196,6 +196,17 @@ SCRATCH="\${POST_TRAIN_BENCH_TMP_ROOT:-/tmp}"
 mkdir -p "\$SCRATCH" || { echo "FATAL: cannot create \$SCRATCH on \$(hostname)" >&2; exit 1; }
 [ -w "\$SCRATCH" ] || { echo "FATAL: \$SCRATCH is not writable on \$(hostname)" >&2; exit 1; }
 echo "scratch=\$SCRATCH free=\$(df -h "\$SCRATCH" | tail -1 | awk '{print \$4}')"
+
+# Run the driver from node-local disk. Bash reads a script incrementally and holds a
+# handle on its own inode for the whole run, so a \`git commit\` in this checkout kills
+# every job already running out of it. That is how 82165 and 82166 died -- both after a
+# complete agent phase, both with a finished final_model/ they never got scored. See
+# src/commit_utils/pin_src_locally.sh. This script itself is safe without the pin, since
+# sbatch takes its own copy at submit; the payload it launches is not.
+RUN_TASK="\$(bash src/commit_utils/pin_src_locally.sh "${REPO_ROOT}" "\${SCRATCH}/ptb-src-\${SLURM_JOB_ID}")"
+PINNED_SRC="\$(dirname "\$RUN_TASK")"
+PINNED_ROOT="\$(dirname "\$PINNED_SRC")"
+echo "run_task=\$RUN_TASK"
 
 ${PAYLOAD}
 rc=\$?
