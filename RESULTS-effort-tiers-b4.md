@@ -358,4 +358,136 @@ follows the copy. The working directory deliberately stays on the checkout — l
 takes `REPO_ROOT` from `pwd` and the scoring container binds it by that path.
 
 **83765 and 83818 were submitted before the fix and still carry the unpinned launcher.**
-Do not commit to `src/` in this checkout until they finish.
+But `grep -c pin_src_locally` is the wrong test and it over-freezes the tree. What matters
+is whether bash holds a handle on a checkout file *across* the long command, so read what
+each queued job actually runs:
+
+| job | long command | exposed? |
+| --- | --- | --- |
+| 83765, 83818 | `bash src/run_task.sh …`, multi-hour | **yes** |
+| 83998, 83999, 84024 | `source …/set_env_vars.sh` then `apptainer exec` inline | no |
+| 83997 | pinned | no |
+
+A `source` is one short read at that instant, and `python3 foo.py` reads the whole file at
+import; neither holds a handle. 83998, 83999 and 84024 all grep as "unpinned" and are all
+safe, because their long body lives in the **sbatch**, which slurm snapshotted at submit.
+
+So the freeze is one file — `src/run_task.sh` — for one window, 2026-09-01T11:36 to
+roughly 2026-09-02T03:36. Everything else in the checkout stays editable throughout.
+
+---
+
+# The board re-read from the checkpoints, 2026-08-30
+
+Everything in this section is computed from what is on disk right now — 27 `final_model/`
+directories under `ptb-results/`, 25 of them with a `metrics.json` — and needed no GPU.
+The two unscored ones are the recovered ten-hour cells, queued as 83998/83999.
+
+## Every scored cell, with the decode it shipped
+
+| score | arm | cell | `temperature` | `do_sample` | `eos_token_id` |
+| ---: | --- | --- | --- | --- | --- |
+| 0.7309 | `pt` | 82822_g6 | **0.0** | false | `[151645,151643]` |
+| 0.7293 | `pt` | 82823_g3 | **0.0** | false | `[151645,151643]` |
+| 0.4716 | `vertex-1h` | 81521 | absent | absent | `[151645,151643]` |
+| 0.4284 | `pt` | 82648_g2 | absent | absent | `151645` |
+| 0.4177 | `pt` | 82823_g4 | absent | false | `[151645,151643]` |
+| 0.3669 | `pt` | 82823_g0 | absent | absent | `[151643,151645]` |
+| 0.3632 | `ctl` | 82822_g4 | absent | absent | `[151645,151643]` |
+| 0.3033 | `ctl` | 82823_g2 | absent | absent | `[151645,151643]` |
+| 0.2570 | `pt` | 82648_g4 | absent | false | `[151645,151643]` |
+| 0.2123 | `pt` | 82823_g7 | absent | absent | `[151645,151643]` |
+| 0.1259 | `ctl` | 82823_g1 | absent | false | `151643` |
+| 0.1243 | `ctl` | 82647_g0 | absent | absent | `[151645,151643]` |
+| 0.1236 | `ctl` | 82822_g7 | absent | false | `151643` |
+| 0.1175 | `pt` | 82822_g5 | absent | false | `151643` |
+| 0.1175 | `ctl` | 82648_g1 | absent | false | `151643` |
+| 0.1168 | `ctl` | 82823_g6 | absent | false | `151643` |
+| 0.1152 | `ctl` | 82823_g5 | absent | false | `151643` |
+| 0.1130 | `pt` | 82822_g1 | absent | false | `151643` |
+| 0.1099 | `pt` | 82648_g0 | absent | false | `151643` |
+| 0.0849 | `ctl` | 82822_g3 | absent | absent | `[151645,151643]` |
+| 0.0728 | `ctl` | 82648_g5 | absent | absent | `151643` |
+| 0.0591 | `ctl` | 82822_g0 | absent | absent | `[151645,151643]` |
+| 0.0569 | `pt` | 82822_g2 | absent | absent | `[151645,151643]` |
+| 0.0553 | `autor-1h` | 81520 | absent | absent | `151645` |
+| 0.0485 | `ctl` | 82648_g3 | absent | false | `[151645,151643]` |
+
+All twenty-five shipped a `generation_config.json`. Two set a temperature.
+
+## The arm contrast, and how much of it is decoding
+
+`pt` and `ctl` are interleaved across the same packs (82648, 82822, 82823), so this is a
+same-batch comparison on the same nodes. One-sided permutation test on the difference of
+means, every partition enumerated exactly:
+
+| comparison | n | mean | diff | p | partitions |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pt` vs `ctl`, all cells | 11 / 12 | 0.3218 / 0.1379 | **+0.1839** | **0.0104** | 1,352,078 |
+| same, `pt`'s two greedy cells removed | 9 / 12 | 0.2311 / 0.1379 | **+0.0931** | **0.0477** | 293,930 |
+
+So `pt` is ahead, and **about half its margin is the two cells that fixed the decode**.
+The remainder is real but sits exactly on the conventional line, from one batch, and it is
+one of several comparisons drawn off this board — treat it as suggestive, not established.
+
+## Channel one: sampling temperature
+
+| | n | mean | min | max |
+| --- | ---: | ---: | ---: | ---: |
+| shipped `temperature: 0.0` | 2 | 0.7301 | 0.7293 | 0.7309 |
+| everything else | 23 | 0.1853 | 0.0485 | 0.4716 |
+
+Perfectly separated: the lower greedy cell beats the highest non-greedy cell by **0.2578**.
+Two specific cells landing in the top two of twenty-five by chance is 1/C(25,2) = **0.0033**.
+
+## Channel two: the stop token, which is a separate defect
+
+`Qwen3-1.7B-Base` is a base model; the agents fine-tune it against a chat template whose
+turn ends with `<|im_end|>` (151645). A `generation_config.json` that lists only 151643
+(`<|endoftext|>`) therefore names a stop token the fine-tuned model does not emit, so
+generation runs to the 4000-token cap and `match(numeric=True)` reads the tail. Same
+outcome as temperature 1.0, different cause, and it is not the same cells:
+
+| | n | mean | min | max | above the 0.1198 floor |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `eos_token_id` includes 151645 | 16 | 0.2944 | 0.0485 | 0.7309 | 11/16 |
+| `eos_token_id` is 151643 alone | 9 | 0.1125 | 0.0728 | 0.1259 | 2/9 |
+
+`diff = +0.1819`, one-sided permutation `p = 0.00656` (2,042,975 partitions). It is not a
+proxy for the temperature finding — dropping the two greedy cells leaves **+0.1196,
+p = 0.0164** — and it is not a proxy for the arm, because it holds inside both:
+
+| arm | with 151645 | 151643 alone |
+| --- | --- | --- |
+| `pt` | n=8, mean 0.3999 | n=3, mean 0.1135 |
+| `ctl` | n=6, mean 0.1639 | n=6, mean 0.1120 |
+
+The nine `151643`-only cells span 0.0728–0.1259. That is not a weak spread of results, it
+is the untrained model's score with noise on it: **a wrong stop token pins the cell to the
+floor no matter what the training did.**
+
+### This changes what job 84024 will settle
+
+84024 equalises temperature across the board but deliberately leaves `eos_token_id` as each
+cell shipped it, on the grounds that forcing a stop token a cell did not train toward would
+swap one confound for another. That reasoning is right about *replacing* the list and wrong
+about *extending* it: adding 151645 to a cell that lists only 151643 cannot truncate a model
+that really does emit `<|endoftext|>`, because 151643 stays in the list — generation stops
+at whichever arrives first. As written, 84024 will hand back a board still carrying a
++0.12 confound in nine of its cells.
+
+## Half the board is no better than not training at all
+
+| arm | n | above 0.1198 | at or below |
+| --- | ---: | ---: | ---: |
+| `pt` | 11 | 7 | 4 |
+| `ctl` | 12 | 5 | 7 |
+| `autor-1h` | 1 | 0 | 1 |
+| `vertex-1h` | 1 | 1 | 0 |
+| **total** | **25** | **13** | **12 (48%)** |
+
+Three cells of twenty-five clear 0.4668, the reference this benchmark is actually read
+against. And 0.1198 is itself a temperature-1.0 number — the one greedy measurement of the
+untrained model is 0.2667 — so under a fixed decode the floor rises and the 48% gets worse,
+not better. That is the single largest fact on this board, and it is not a tuning problem:
+a run that ships something worse than its own starting point had no gate stopping it.
