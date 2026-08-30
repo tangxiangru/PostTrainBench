@@ -1,6 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=ptb-pack6
 #SBATCH --partition=a3
+# Superseded by ptb_pack.sbatch, but job 82648 was launched from a copy of this file, so
+# it is still a live submit path. 11 of a3's 14 nodes are reserved -- see ptb_pack.sbatch.
+#SBATCH --reservation=robtang-a3
 #SBATCH --nodes=1
 #SBATCH --exclusive
 #SBATCH --gres=gpu:8

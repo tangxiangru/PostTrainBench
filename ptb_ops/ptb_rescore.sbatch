@@ -1,6 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=ptb-rescore
 #SBATCH --partition=a3
+# 11 of a3's 14 nodes are held by reservation robtang-a3; without this line the job is
+# unschedulable rather than merely queued. See ptb_pack.sbatch for why it cannot be an
+# environment variable.
+#SBATCH --reservation=robtang-a3
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G

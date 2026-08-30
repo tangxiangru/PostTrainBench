@@ -1,6 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=ptb-pack
 #SBATCH --partition=a3
+# 11 of a3's 14 nodes are held by reservation robtang-a3, the other 3 by froilanchoi's
+# UNLIMITED jobs, so a pack submitted without the reservation never starts -- it waits on
+# three nodes that never free and squeue calls it (Resources). Not settable from the
+# environment: SBATCH_RESERVATION applies to every partition, and an airs/eval job that
+# inherits it dies at submit with "allocation failure".
+#SBATCH --reservation=robtang-a3
 #SBATCH --nodes=1
 #SBATCH --exclusive
 #SBATCH --gres=gpu:8

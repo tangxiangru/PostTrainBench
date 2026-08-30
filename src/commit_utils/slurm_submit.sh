@@ -57,8 +57,8 @@
 #   slurm_submit.sh task     <task> <agent> <model> <num_hours> <agent_config>
 #   slurm_submit.sh rerun    <eval_dir> [n]
 #
-# Environment overrides: PTB_PARTITION, PTB_TIME, PTB_CPUS, PTB_MEM,
-# PTB_LOG_DIR, PTB_DRY_RUN=1.
+# Environment overrides: PTB_PARTITION, PTB_RESERVATION, PTB_TIME, PTB_CPUS,
+# PTB_MEM, PTB_LOG_DIR, PTB_DRY_RUN=1.
 set -euo pipefail
 
 # No braces in this message: the first '}' would close the expansion early and
@@ -71,6 +71,20 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 PARTITION="${PTB_PARTITION:-a3}"
+
+# a3 is fourteen nodes: eleven are held by reservation robtang-a3 and the other
+# three by froilanchoi's UNLIMITED jobs. An a3 job that does not carry the
+# reservation is therefore unschedulable rather than merely queued -- it waits on
+# three nodes that never free, and squeue reports the ordinary (Resources).
+#
+# It must NOT be set for any other partition. The reservation names only a3 nodes,
+# so an airs or eval submission carrying it dies at submit with "allocation
+# failure: Requested node configuration is not available". That is why this is a
+# per-partition line and not SBATCH_RESERVATION in the environment: the variable
+# applies to every sbatch this shell ever runs and cannot tell the two apart.
+RESERVATION_LINE="# no reservation: partition is ${PARTITION}, not a3"
+[ "$PARTITION" = a3 ] && RESERVATION_LINE="#SBATCH --reservation=${PTB_RESERVATION:-robtang-a3}"
+
 CPUS="${PTB_CPUS:-16}"
 MEM="${PTB_MEM:-128G}"
 LOG_DIR="${PTB_LOG_DIR:-$REPO_ROOT/slurm_logs}"
@@ -122,6 +136,7 @@ cat > "$JOB_SCRIPT" <<EOF
 #!/bin/bash
 #SBATCH --job-name=${JOB_NAME}
 #SBATCH --partition=${PARTITION}
+${RESERVATION_LINE}
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=${CPUS}
 #SBATCH --mem=${MEM}
