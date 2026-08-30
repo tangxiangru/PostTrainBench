@@ -249,3 +249,11 @@ posttrainbench-website/
 
 # HTCondor scheduler logs from rerun_specific_runs.sh submissions
 src/disallowed_usage_judge/rerun_judge/rerun_specific_runs_logs/
+
+# The AutoR payload is a clone of another repository, pinned by tools/ptb_setup.py
+# and reported by code_version(); tracking it here would make it a gitlink and the
+# arm would then be pinned in two places that can disagree.
+agents/*/payload/
+
+# Job scripts and their stdout/stderr, one pair per submission.
+slurm_logs/

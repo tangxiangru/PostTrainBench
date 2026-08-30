@@ -159,6 +159,18 @@ echo "skip_cli_update=${POST_TRAIN_BENCH_SKIP_CLI_UPDATE:-<unset: each arm updat
 
 cd "${REPO_ROOT}"
 source src/commit_utils/set_env_vars.sh
+
+# This cluster exports HUGGINGFACE_HUB_CACHE globally, pointing at the real shared
+# cache. Every scoring container is launched without --cleanenv, and huggingface_hub
+# ranks HF_HUB_CACHE above HUGGINGFACE_HUB_CACHE above "\$HF_HOME/hub" -- so the
+# --env HF_HOME those execs pass loses, the fuse-overlayfs mount goes unread, and the
+# unbound host path gets created on the 64 MiB --writable-tmpfs container root. The
+# download then dies as ENOSPC with 5.9T free on every host filesystem. The exec
+# lines in run_baseline.sh name all three explicitly; unsetting here covers the call
+# sites that do not, and costs nothing where they do -- HF_HOME is untouched, so
+# host-side resolution lands on the same directory these two named.
+unset HUGGINGFACE_HUB_CACHE HF_HUB_CACHE
+echo "hf_home=\${HF_HOME:-<unset>} hub_cache_overrides=cleared"
 # Fail here rather than deep inside run_task.sh. The scratch root is node-local
 # by design -- request_disk = 400G in single_task.sub -- so it is the one path in
 # this script whose existence is a property of the node the scheduler picked and

@@ -66,10 +66,27 @@ with_record_the_time() {
     return $exit_code
 }
 
+# --env HF_HOME is not enough on its own. huggingface_hub resolves its cache as
+# HF_HUB_CACHE, else HUGGINGFACE_HUB_CACHE, else "$HF_HOME/hub" -- HF_HOME is the
+# lowest-priority of the three. These apptainer execs do not pass --cleanenv, so a
+# host that exports HUGGINGFACE_HUB_CACHE (this cluster does, globally, pointing at
+# the real shared cache) has that value win inside the container, and the overlay
+# mounted at TMP_HF_CACHE is never read. The host path is not bound in, so the hub
+# then materialises it on the container root -- which --writable-tmpfs caps at
+# `sessiondir max size` (64 MiB here) -- and the 3.4 GB download dies as
+# "OSError: [Errno 28] No space left on device" inside file_download.py, four
+# frames below anything that mentions a cache. Naming all three leaves nothing for
+# the ambient environment to decide.
+HF_CACHE_ENV=(
+    --env HF_HOME="${TMP_HF_CACHE}"
+    --env HF_HUB_CACHE="${TMP_HF_CACHE}/hub"
+    --env HUGGINGFACE_HUB_CACHE="${TMP_HF_CACHE}/hub"
+)
+
 check_cuda() {
     apptainer exec \
         --nv \
-        --env HF_HOME="${TMP_HF_CACHE}" \
+        "${HF_CACHE_ENV[@]}" \
         --writable-tmpfs \
         --bind "${REPO_ROOT}:${REPO_ROOT}" \
         --bind "${HF_MERGED}:${TMP_HF_CACHE}" \
@@ -80,7 +97,7 @@ check_cuda() {
 run_eval() {
     apptainer exec \
         --nv \
-        --env HF_HOME="${TMP_HF_CACHE}" \
+        "${HF_CACHE_ENV[@]}" \
         --env OPENAI_API_KEY="${OPENAI_API_KEY:-}" \
         --env VLLM_API_KEY="inspectai" \
         --env VLLM_LOGGING_LEVEL="DEBUG" \
