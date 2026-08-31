@@ -24,6 +24,7 @@ class ContextValidationTest(unittest.TestCase):
                     "requested_model": "claude-opus-5[1m]",
                     "provider": "vertex",
                     "verified": True,
+                    "requested_context_tokens": 1_000_000,
                     "resolved_context_tokens": 1_000_000,
                 }
             ),
@@ -43,13 +44,22 @@ class ContextValidationTest(unittest.TestCase):
 
     def test_matching_frozen_digest_passes(self) -> None:
         with patch.dict(os.environ, self.environment(self.digest), clear=False):
-            loaded = load_context_validation("claude-opus-5[1m]")
+            loaded = load_context_validation("claude-opus-5[1m]", 1_000_000)
         self.assertEqual(loaded["sha256"], self.digest)
 
     def test_changed_record_fails(self) -> None:
-        with patch.dict(os.environ, self.environment("0" * 64), clear=False):
-            with self.assertRaises(SystemExit):
-                load_context_validation("claude-opus-5[1m]")
+        with (
+            patch.dict(os.environ, self.environment("0" * 64), clear=False),
+            self.assertRaises(SystemExit),
+        ):
+            load_context_validation("claude-opus-5[1m]", 1_000_000)
+
+    def test_resolved_context_must_match_profile_exactly(self) -> None:
+        with (
+            patch.dict(os.environ, self.environment(self.digest), clear=False),
+            self.assertRaises(SystemExit),
+        ):
+            load_context_validation("claude-opus-5[1m]", 200_000)
 
 
 if __name__ == "__main__":

@@ -55,7 +55,9 @@ def gpu_uuids() -> list[str]:
     return [line.strip() for line in raw.splitlines() if line.strip() and line != "unknown"]
 
 
-def load_context_validation(requested_model: str) -> dict[str, Any] | None:
+def load_context_validation(
+    requested_model: str, requested_context_tokens: int | None = None
+) -> dict[str, Any] | None:
     record_name = os.environ.get("POST_TRAIN_BENCH_CONTEXT_VALIDATION_RECORD", "")
     required = os.environ.get("POST_TRAIN_BENCH_REQUIRE_CONTEXT_VALIDATION", "0") == "1"
     if not record_name:
@@ -81,8 +83,11 @@ def load_context_validation(requested_model: str) -> dict[str, Any] | None:
         )
     if data.get("provider") != "vertex" or data.get("verified") is not True:
         raise SystemExit("context validation must be a verified Vertex provider result")
-    if int(data.get("resolved_context_tokens", 0)) < 1_000_000:
-        raise SystemExit("context validation did not resolve a >=1M context window")
+    if requested_context_tokens is not None:
+        if int(data.get("requested_context_tokens", 0)) != requested_context_tokens:
+            raise SystemExit("context validation requested context differs from agent profile")
+        if int(data.get("resolved_context_tokens", 0)) != requested_context_tokens:
+            raise SystemExit("context validation resolved context differs from agent profile")
     return {"path": str(path.resolve()), "sha256": actual_digest, "record": data}
 
 
@@ -100,7 +105,11 @@ def init(args: argparse.Namespace) -> None:
     top = command("git", "rev-parse", "--show-superproject-working-tree", cwd=repo)
     top_path = Path(top) if top and top != "unknown" else repo
     requested_context = os.environ.get("PTB_AGENT_REQUESTED_CONTEXT_TOKENS", "unknown")
-    context_validation = load_context_validation(args.agent_config)
+    requested_context_tokens = int(requested_context) if requested_context.isdigit() else None
+    frozen_context = os.environ.get("POST_TRAIN_BENCH_EXPECTED_CONTEXT_TOKENS", "")
+    if frozen_context.isdigit() and requested_context_tokens != int(frozen_context):
+        raise SystemExit("agent profile context differs from frozen cell setup")
+    context_validation = load_context_validation(args.agent_config, requested_context_tokens)
     base_model_revision = os.environ.get("POST_TRAIN_BENCH_BASE_MODEL_REVISION", "")
     base_model_cache_key = "models--" + args.base_model.replace("/", "--")
     base_model_snapshot = (
@@ -115,6 +124,10 @@ def init(args: argparse.Namespace) -> None:
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "experiment": {
+            "batch_id": os.environ.get("POST_TRAIN_BENCH_BATCH_ID", "untracked"),
+            "cell_id": os.environ.get("POST_TRAIN_BENCH_CELL_ID", "untracked"),
+            "run_purpose": os.environ.get("POST_TRAIN_BENCH_RUN_PURPOSE", "untracked"),
+            "spec_path": os.environ.get("POST_TRAIN_BENCH_SPEC_PATH", "untracked"),
             "task": args.task,
             "agent": args.agent,
             "agent_config": args.agent_config,
@@ -150,6 +163,8 @@ def init(args: argparse.Namespace) -> None:
         "slurm": {
             "cluster": os.environ.get("SLURM_CLUSTER_NAME"),
             "job_id": os.environ.get("SLURM_JOB_ID"),
+            "job_name": os.environ.get("SLURM_JOB_NAME")
+            or os.environ.get("POST_TRAIN_BENCH_SLURM_JOB_NAME"),
             "node": os.environ.get("SLURMD_NODENAME") or command("hostname"),
             "partition": os.environ.get("SLURM_JOB_PARTITION"),
             "job_gpus": os.environ.get("SLURM_JOB_GPUS"),
@@ -159,6 +174,9 @@ def init(args: argparse.Namespace) -> None:
             "gpu_uuids": gpu_uuids(),
         },
         "source": {
+            "top_branch": os.environ.get("POST_TRAIN_BENCH_FROZEN_TOP_BRANCH")
+            or os.environ.get("POST_TRAIN_BENCH_RUN_BRANCH")
+            or command("git", "branch", "--show-current", cwd=top_path),
             "top_commit": os.environ.get("POST_TRAIN_BENCH_FROZEN_TOP_COMMIT")
             or command("git", "rev-parse", "HEAD", cwd=top_path),
             "ptb_commit": os.environ.get("POST_TRAIN_BENCH_FROZEN_PTB_COMMIT")

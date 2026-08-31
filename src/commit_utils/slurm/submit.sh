@@ -15,7 +15,9 @@ Usage:
 
 Options:
   --gpus <n>                GPUs exposed to the run (default: 1)
-  --experiment-name <name>  Result-directory suffix (default: empty)
+  --run-branch <name>        Owning top-level Git branch (required)
+  --job-name <name>          Unique Slurm name beginning with <run-branch>. (required)
+  --experiment-name <name>  Result suffix beginning with _<run-branch>_ (required)
   --judge-profile <name>    official or claude (default: .env or official)
   --walltime <slurm-time>   Override computed Slurm walltime
   --preflight-only          Check the selected node without running PTB
@@ -33,6 +35,8 @@ NUM_HOURS=""
 AGENT_CONFIG=""
 NUM_GPUS="1"
 EXPERIMENT_NAME=""
+RUN_BRANCH=""
+REQUESTED_JOB_NAME=""
 REQUESTED_JUDGE_PROFILE=""
 WALLTIME=""
 PREFLIGHT_ONLY=0
@@ -48,6 +52,8 @@ while [ "$#" -gt 0 ]; do
         --hours) NUM_HOURS="${2:?missing value for --hours}"; shift 2 ;;
         --agent-config) AGENT_CONFIG="${2:?missing value for --agent-config}"; shift 2 ;;
         --gpus) NUM_GPUS="${2:?missing value for --gpus}"; shift 2 ;;
+        --run-branch) RUN_BRANCH="${2:?missing value for --run-branch}"; shift 2 ;;
+        --job-name) REQUESTED_JOB_NAME="${2:?missing value for --job-name}"; shift 2 ;;
         --experiment-name) EXPERIMENT_NAME="${2:?missing value for --experiment-name}"; shift 2 ;;
         --judge-profile) REQUESTED_JUDGE_PROFILE="${2:?missing value for --judge-profile}"; shift 2 ;;
         --walltime) WALLTIME="${2:?missing value for --walltime}"; shift 2 ;;
@@ -59,6 +65,36 @@ while [ "$#" -gt 0 ]; do
         *) echo "ERROR: unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+RUN_BRANCH_SAFE="$(printf '%s' "$RUN_BRANCH" | tr -c 'A-Za-z0-9_.-' '-')"
+JOB_NAME_SAFE="$(printf '%s' "$REQUESTED_JOB_NAME" | tr -c 'A-Za-z0-9_.-' '-')"
+if [ -z "$RUN_BRANCH" ] || [ "$RUN_BRANCH_SAFE" != "$RUN_BRANCH" ]; then
+    echo "ERROR: --run-branch must be a non-empty Slurm-safe branch name" >&2
+    exit 2
+fi
+if [ -z "$REQUESTED_JOB_NAME" ] || [ "$JOB_NAME_SAFE" != "$REQUESTED_JOB_NAME" ] \
+    || [[ "$JOB_NAME_SAFE" != "${RUN_BRANCH_SAFE}."* ]]; then
+    echo "ERROR: --job-name must be Slurm-safe and begin with ${RUN_BRANCH_SAFE}." >&2
+    exit 2
+fi
+if [ "${#JOB_NAME_SAFE}" -gt 128 ]; then
+    echo "ERROR: --job-name exceeds 128 characters" >&2
+    exit 2
+fi
+if [ -z "$EXPERIMENT_NAME" ] || [[ "$EXPERIMENT_NAME" != "_${RUN_BRANCH_SAFE}_"* ]]; then
+    echo "ERROR: --experiment-name must begin with _${RUN_BRANCH_SAFE}_" >&2
+    exit 2
+fi
+
+SUPERPROJECT_ROOT="$(git -C "$REPO_ROOT" rev-parse --show-superproject-working-tree 2>/dev/null || true)"
+OWNERSHIP_ROOT="${SUPERPROJECT_ROOT:-$REPO_ROOT}"
+CURRENT_BRANCH="$(git -C "$OWNERSHIP_ROOT" branch --show-current 2>/dev/null || true)"
+if [ -z "$CURRENT_BRANCH" ] || [ "$CURRENT_BRANCH" != "$RUN_BRANCH" ]; then
+    echo "ERROR: current ownership branch ${CURRENT_BRANCH:-<detached>} does not match --run-branch $RUN_BRANCH" >&2
+    exit 1
+fi
+export POST_TRAIN_BENCH_RUN_BRANCH="$RUN_BRANCH"
+export POST_TRAIN_BENCH_SLURM_JOB_NAME="$JOB_NAME_SAFE"
 
 for value_name in EVALUATION_TASK AGENT MODEL_TO_TRAIN NUM_HOURS AGENT_CONFIG; do
     if [ -z "${!value_name}" ]; then
@@ -120,7 +156,6 @@ if [ -z "$WALLTIME" ]; then
 fi
 
 mkdir -p logs/slurm
-JOB_NAME_SAFE="$(printf 'ptb-%s-%s' "$EVALUATION_TASK" "$AGENT" | tr -c 'A-Za-z0-9_.-' '-')"
 
 SBATCH_ARGS=(
     --parsable

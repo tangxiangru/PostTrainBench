@@ -72,7 +72,7 @@ verified = (
     int(probe_status) == 0
     and not result.get("is_error")
     and result.get("api_error_status") in (None, 0)
-    and resolved_context >= requested_context
+    and resolved_context == requested_context
 )
 raw_bytes = Path(raw_path).read_bytes()
 image_path = Path(image)

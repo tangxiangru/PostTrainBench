@@ -66,6 +66,9 @@ bash src/commit_utils/slurm/submit.sh \
   --model google/gemma-3-4b-pt \
   --hours 10 \
   --agent-config gpt-5.4 \
+  --run-branch gangda_trial_0828 \
+  --job-name gangda_trial_0828.ptb.example.gsm8k.preflight.r1 \
+  --experiment-name _gangda_trial_0828_example_gsm8k_preflight_r1 \
   --preflight-only
 ```
 
@@ -78,6 +81,9 @@ bash src/commit_utils/slurm/submit.sh \
   --model google/gemma-3-4b-pt \
   --hours 10 \
   --agent-config gpt-5.4 \
+  --run-branch gangda_trial_0828 \
+  --job-name gangda_trial_0828.ptb.example.gsm8k.runtime-smoke.r1 \
+  --experiment-name _gangda_trial_0828_example_gsm8k_runtime_smoke_r1 \
   --runtime-smoke
 ```
 
@@ -94,8 +100,10 @@ bash src/commit_utils/slurm/submit.sh \
   --model google/gemma-3-4b-pt \
   --hours 10 \
   --agent-config gpt-5.4 \
+  --run-branch gangda_trial_0828 \
+  --job-name gangda_trial_0828.ptb.example.gsm8k.formal.r1 \
   --judge-profile official \
-  --experiment-name _gsm8k_gemma_v1
+  --experiment-name _gangda_trial_0828_example_gsm8k_formal_r1
 ```
 
 Pass `--judge-profile claude` to override `.env` for one submission. Its
@@ -124,17 +132,28 @@ POST_TRAIN_BENCH_JUDGE_LOCK_FILE="/shared/ptb-locks/official-judges.lock"
 
 The completion contract requires `final_model/config.json`, `metrics.json`, and all four canonical official verdicts. Runtime provenance records the source commits, Slurm allocation/GPU UUID, agent model/context/effort/provider, CLI version, and agent/judge SIF digests. Shared ChatGPT subscription auth is protected by the cross-node lock for the entire official judge phase.
 
-Before a pilot, execute the ordered shared-node gates on an otherwise idle target node:
+Claude Vertex experiment profiles freeze effort and requested context together. The reusable Opus
+profiles are `claude_vertex_max`, `claude_vertex_xhigh`, and `claude_vertex_high` for 1M context,
+plus `claude_vertex_max_200k` for native 200K context. `context_probe.sh` requires the provider's
+resolved context window to equal the profile value exactly; a larger or smaller route is not an
+acceptable substitute for the requested experiment setup.
+
+Before a pilot, execute the ordered shared-node gates on an otherwise idle target node. The
+required batch id plus the current top-level Git branch are embedded in every gate job name:
 
 ```bash
-bash src/commit_utils/slurm/run_gates.sh g1 gpu-node-0
-bash src/commit_utils/slurm/run_gates.sh g2 gpu-node-0
-bash src/commit_utils/slurm/run_gates.sh g3 gpu-node-0
+bash src/commit_utils/slurm/run_gates.sh g1 gpu-node-0 my-batch-id
+bash src/commit_utils/slurm/run_gates.sh g2 gpu-node-0 my-batch-id
+bash src/commit_utils/slurm/run_gates.sh g3 gpu-node-0 my-batch-id
 ```
 
 G1 checks two simultaneous allocations, H100 visibility and device cgroups. G2 checks eight unique GPUs and a ninth pending job. G3 proves the evaluation cleanup function cannot kill a survivor on another allocation.
 
 ## Current limits
+
+- Shared Unix accounts are not ownership evidence. Every Slurm submission must carry the current
+  top-level branch in `JobName` and the result suffix; project launchers must additionally freeze
+  spec/batch/cell/commit identity in a receipt. Never cancel jobs by username or a generic prefix.
 
 - The adapter submits one benchmark cell at a time. A project-level experiment launcher may submit several cells; Slurm distributes them across eligible nodes.
 - A full official run still requires the agent/eval/judge SIFs, task `test_data.json`, model access, agent credentials, ChatGPT judge auth, and a real-provider context-validation record when that gate is enabled.
