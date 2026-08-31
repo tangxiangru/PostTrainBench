@@ -204,7 +204,9 @@ final_model."
 
 ## Batch 5, submitted: does bounding the walk help or hurt?
 
-Job **83765**, 8 cells on one node, queued behind 82648.
+Job **84425**, 8 cells on one node. Submitted as 83765, which carried the unpinned
+launcher (see below); cancelled at 0:00 elapsed and resubmitted 2026-08-31 with identical
+argv and the pinned one. Cells are therefore `84425_g0..g7`, not `83765_g*`.
 
 | arm | payload | `--stage-quotas` |
 | --- | --- | --- |
@@ -364,16 +366,38 @@ each queued job actually runs:
 
 | job | long command | exposed? |
 | --- | --- | --- |
-| 83765, 83818 | `bash src/run_task.sh …`, multi-hour | **yes** |
+| ~~83765~~, 83818 | `bash src/run_task.sh …`, multi-hour | **yes** |
 | 83998, 83999, 84024 | `source …/set_env_vars.sh` then `apptainer exec` inline | no |
-| 83997 | pinned | no |
+| 83997, 84363, 84364, **84425** | pinned | no |
 
 A `source` is one short read at that instant, and `python3 foo.py` reads the whole file at
 import; neither holds a handle. 83998, 83999 and 84024 all grep as "unpinned" and are all
 safe, because their long body lives in the **sbatch**, which slurm snapshotted at submit.
 
-So the freeze is one file — `src/run_task.sh` — for one window, 2026-09-01T11:36 to
-roughly 2026-09-02T03:36. Everything else in the checkout stays editable throughout.
+### 83765 is now 84425, and the freeze is down to one job
+
+A freeze is a rule a person has to remember, and the thing that would break it is another
+session's `Write`, which no hook here can intercept — a `pre-commit` guard fires after the
+inode has already been replaced. So where the job can be reissued exactly, reissuing it is
+the only remedy with teeth.
+
+83765 could: it was PENDING at **0:00 elapsed**, its argv is in `sacct SubmitLine`, its
+`--time` is the sbatch default, and this section records it ran "at 1 h", i.e. no
+`PTB_NUM_HOURS` override — the five env knobs are all at their defaults. Cancelled and
+resubmitted as **84425**; its frozen script hashes `491ad070`, byte-identical to 83997's,
+and slurm still estimates the same start (2026-09-01T11:36:33), because all seven pending
+a3 jobs are waiting on the same eleven reservation nodes to drain together. A new job id
+costs no queue position here.
+
+**83818 stays.** It was submitted `--time=16:00:00` against a 4 h default, which means an
+env override this file never recorded, and `scontrol`/`sacct`/`--json` expose a pending
+job's argv but never its environment. Resubmitting it would mean guessing `PTB_NUM_HOURS`,
+and silently running a different experiment is worse than the conditional risk of the
+handle. It is documented, not fixed.
+
+So the freeze is one file — `src/run_task.sh` — for one job, 83818, over one window,
+2026-09-01T11:36 to roughly 2026-09-02T03:36. Everything else in the checkout, and every
+other queued job, stays editable throughout.
 
 ---
 
