@@ -69,7 +69,7 @@ mkdir -p "${PTB_SCRATCH_ROOT}"
 export TMP_SUBDIR="${PTB_SCRATCH_ROOT%/}/posttrain_container_${EVALUATION_TASK}_${RESULT_PREFIX_SAFE}_${RANDOM_UUID}"
 
 JOB_DIR="${TMP_SUBDIR}/job_dir"
-JOB_TMP="${TMP_SUBDIR}/tmp"
+export JOB_TMP="${TMP_SUBDIR}/tmp"
 export HF_MERGED="${TMP_SUBDIR}/merged_huggingface"
 
 mkdir -p "${JOB_DIR}"
@@ -588,6 +588,7 @@ run_evaluation() {
         --writable-tmpfs \
         --bind "${JOB_TMP}:/tmp" \
         --bind "${REPO_ROOT}:${REPO_ROOT}" \
+        --bind "${EVAL_DIR}:${EVAL_DIR}" \
         --bind "${HF_MERGED}:${TMP_HF_CACHE}" \
         --pwd "$(pwd)/src/eval/tasks/${EVALUATION_TASK}" \
         ${POST_TRAIN_BENCH_CONTAINERS_DIR}/vllm_debug.sif python "${EVAL_SCRIPT}" \

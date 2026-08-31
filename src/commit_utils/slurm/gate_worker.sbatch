@@ -107,6 +107,11 @@ PY
         source src/utils/gpu_reap.sh
         ptb_reap_allocated_gpu_processes
         wait "$own_gpu_pid" 2>/dev/null || true
+        apptainer exec --nv -c --cleanenv \
+            --env "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}" \
+            --writable-tmpfs "$IMAGE" \
+            python -c 'import torch; x=torch.ones((1024,1024), device="cuda"); x.add_(1); torch.cuda.synchronize(); print(torch.cuda.get_device_name(0), float(x[0,0]))' \
+            > "$GATE_DIR/reaper-eval-smoke.txt"
         sleep 15
         after="$(cat "$GATE_DIR/survivor.heartbeat")"
         if [ "$before" = "$after" ]; then
