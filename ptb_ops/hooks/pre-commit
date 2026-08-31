@@ -1,0 +1,102 @@
+#!/bin/bash
+# Refuse a commit that would replace a driver script under a job already reading it.
+#
+# bash reads a script incrementally. A `git commit` that changes a file writes a NEW inode
+# at that path, and a job whose shell is part way through the OLD one gets ESTALE the next
+# time it reads -- which is when the long command in front of it returns, so the failure
+# lands hours after the commit and names neither. That is how 82165 and 82166 lost ten
+# H100-hours each.
+#
+# src/commit_utils/pin_src_locally.sh is the real fix: it copies the shell half of src/ to
+# node-local disk, so a job that pins is immune for every file below. This hook is for jobs
+# submitted before that existed and still queued -- their batch script is frozen in Slurm's
+# spool and cannot be repaired, so the only protection left is on the writing side.
+#
+# Two narrowings, because a guard that fires when it need not is a guard people disable:
+#   1. Only files a job reads AFTER it has started are guarded.
+#   2. Only a job that actually invokes the entry point that reads them can veto. A rescore
+#      job runs evaluate.py in a container and never opens run_task.sh; it has no opinion
+#      about a commit to run_task.sh, and asking it produces a false refusal.
+#
+# Not tracked by git: delete this file to remove it. --no-verify overrides it once.
+
+set -uo pipefail
+
+# guarded path -> the entry point whose invocation exposes a job to it. run_task.sh sources
+# or runs the middle three, so nothing reaches them except through it.
+declare -A ENTRY=(
+    ["src/run_task.sh"]="run_task.sh"
+    ["src/commit_utils/set_env_vars.sh"]="run_task.sh"
+    ["src/judges/judge_lib.sh"]="run_task.sh"
+    ["src/utils/create_timer.sh"]="run_task.sh"
+    ["src/baselines/run_baseline.sh"]="run_baseline.sh"
+)
+
+staged="$(git diff --cached --name-only)"
+touched=()
+triggers=()
+for path in "${!ENTRY[@]}"; do
+    if grep -qxF "$path" <<<"$staged"; then
+        touched+=("$path")
+        triggers+=("${ENTRY[$path]}")
+    fi
+done
+[ ${#touched[@]} -eq 0 ] && exit 0
+
+command -v squeue >/dev/null 2>&1 || exit 0
+pattern="$(printf '%s\n' "${triggers[@]}" | sort -u | paste -sd'|')"
+
+# scontrol refuses to write over a file that already exists, so hand it a name inside a
+# temp DIRECTORY rather than a temp file: mktemp creates the file, and the failure is
+# silent -- rc 0, nothing written, and every grep below then reads a missing path and
+# answers "no match", which reads exactly like "this job is fine".
+spool="$(mktemp -d)"
+trap 'rm -rf "$spool"' EXIT
+
+exposed=()
+while read -r jobid state; do
+    [ -n "${jobid:-}" ] || continue
+    script="${spool}/${jobid}.sh"
+    if ! scontrol write batch_script "$jobid" "$script" >/dev/null 2>&1 || [ ! -s "$script" ]; then
+        exposed+=("$jobid ($state, batch script unreadable, so not cleared)")
+        continue
+    fi
+    # A pinned job is immune. An unpinned one only matters if it INVOKES the entry point:
+    # 84024 names run_task.sh in a comment explaining what it deliberately does not do, and
+    # a guard that reads comments refuses commits on the strength of prose.
+    grep -q "pin_src_locally.sh" "$script" && continue
+    if sed 's/#.*//' "$script" | grep -qE "$pattern"; then
+        exposed+=("$jobid ($state, unpinned, invokes ${pattern})")
+    fi
+# Scope to this uid. Another account's job cannot be reading this checkout, and its batch
+# script is not ours to read -- asking anyway turns every froilanchoi autolab job into an
+# "unreadable, so not cleared" veto and the guard refuses every commit. Several humans do
+# share this uid, so this is still not "my jobs": it is "jobs that could be in here".
+done < <(squeue -h -u "$(id -un)" -o "%i %T" --states=PENDING,RUNNING 2>/dev/null | awk '{print $1, $2}')
+
+[ ${#exposed[@]} -eq 0 ] && exit 0
+
+{
+    echo
+    echo "REFUSED: this commit rewrites a script a queued job reads after it starts."
+    echo
+    echo "  staged and guarded:"
+    printf '    %s\n' "${touched[@]}"
+    echo
+    echo "  jobs that would read the new inode mid-run:"
+    printf '    %s\n' "${exposed[@]}"
+    echo
+    echo "bash reads a script incrementally, so the ESTALE arrives when the long command in"
+    echo "front of it returns -- hours later, naming neither this commit nor that file."
+    echo
+    echo "Options, in order of preference:"
+    echo "  1. Wait for those jobs to finish, or reissue them on the pinned launcher."
+    echo "  2. Commit the rest now and hold these paths back:"
+    printf '       git restore --staged %s\n' "${touched[@]}"
+    echo "  3. git commit --no-verify   (you have checked that every job above is yours"
+    echo "     and that losing it is acceptable)"
+    echo
+    echo "Installed at .git/hooks/pre-commit; delete that file to remove this check."
+    echo
+} >&2
+exit 1
