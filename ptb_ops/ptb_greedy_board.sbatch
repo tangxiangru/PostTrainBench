@@ -55,6 +55,18 @@ RESULTS_ROOT="${PTB_RESULTS_ROOT:-/rmeng_data/robtang/ptb-results}"
 BASE_SNAPSHOT="${PTB_BASE_SNAPSHOT:-/rmeng_data/cache/robtang_google_com/huggingface/hub/models--Qwen--Qwen3-1.7B-Base/snapshots/ea980cb0a6c2ae4b936e82123acc929f1cec04c1}"
 NPAR="${PTB_GREEDY_NPAR:-8}"
 STAGGER="${PTB_GREEDY_STAGGER:-20}"
+# Physical GPU indices, in order. The default 0..NPAR-1 is right for the whole-node
+# allocation this asks for, and wrong for an `srun --overlap` step on a node whose host
+# job is already using some cards -- there the free indices are whatever nvidia-smi says
+# they are at that moment, and starting a vLLM server on a busy card costs both jobs.
+# `PTB_GREEDY_GPUS="0 1 3 4"` names them and NPAR follows from the list.
+declare -a GPUS=()
+if [ -n "${PTB_GREEDY_GPUS:-}" ]; then
+    read -r -a GPUS <<< "${PTB_GREEDY_GPUS//,/ }"
+    NPAR="${#GPUS[@]}"
+else
+    for (( _g=0; _g<NPAR; _g++ )); do GPUS+=("${_g}"); done
+fi
 # Two levels up from the snapshot, not the snapshot: an HF snapshot directory is a farm
 # of symlinks into a sibling blobs/, so binding only snapshots/ gives the container a
 # model whose every file is a dangling link.
@@ -191,12 +203,12 @@ for (( g=0; g<NPAR && g<N; g++ )); do
         sleep $(( g * STAGGER ))
         for (( i=g; i<N; i+=NPAR )); do
             item="${WORK[$i]}"; label="${item##*:::}"
-            echo "--- gpu=${g} cell=${i} label=${label} at $(date --iso-8601=seconds)"
-            score_one "${g}" "${SHADOWS[$i]}" "${label}"
+            echo "--- gpu=${GPUS[$g]} cell=${i} label=${label} at $(date --iso-8601=seconds)"
+            score_one "${GPUS[$g]}" "${SHADOWS[$i]}" "${label}"
         done
-    ) > "/rmeng_data/robtang/PostTrainBench/slurm_logs/ptb-greedy-${SLURM_JOB_ID}-g${g}.log" 2>&1 &
+    ) > "/rmeng_data/robtang/PostTrainBench/slurm_logs/ptb-greedy-${SLURM_JOB_ID}-g${GPUS[$g]}.log" 2>&1 &
     PIDS+=("$!")
-    echo "launched gpu=${g} pid=${PIDS[$g]}"
+    echo "launched worker=${g} gpu=${GPUS[$g]} pid=${PIDS[$g]}"
 done
 
 rc_all=0
