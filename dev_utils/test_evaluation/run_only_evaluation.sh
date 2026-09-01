@@ -8,8 +8,10 @@ RANDOM_UUID="${SLURM_JOB_ID:-$(uuidgen)}"
 RECOVERY_SCRATCH_ROOT="${POST_TRAIN_BENCH_SCRATCH_DIR:-${TMPDIR:-/tmp}}"
 export TMP_SUBDIR="${RECOVERY_SCRATCH_ROOT%/}/posttrain_container_${EVALUATION_TASK}_${RANDOM_UUID}"
 export HF_MERGED="${TMP_SUBDIR}/merged_huggingface"
+export JOB_TMP="${TMP_SUBDIR}/tmp"
 mkdir -p "${TMP_SUBDIR}"
 mkdir -p "${HF_MERGED}"
+mkdir -p "${JOB_TMP}"
 
 cleanup() {
     fusermount -uz "${TMP_SUBDIR}/merged_huggingface" 2>/dev/null || true
@@ -73,15 +75,37 @@ export EVAL_COUNTER=0
 run_evaluation() {
     local max_tokens_arg="$1"
     local eval_num="$2"
+    local eval_home="${JOB_TMP}/eval-home"
+    local eval_cache="${eval_home}/.cache"
+    mkdir -p \
+        "${eval_cache}/vllm" \
+        "${eval_cache}/torchinductor" \
+        "${eval_cache}/triton" \
+        "${eval_home}/.config"
     with_huggingface_overlay apptainer exec \
         --nv \
+        -c \
+        --cleanenv \
+        --pid \
+        --no-init \
+        --env "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}" \
+        --env "XDG_CACHE_HOME=${HOME}/.cache" \
+        --env "XDG_CONFIG_HOME=${HOME}/.config" \
+        --env "VLLM_CACHE_ROOT=${HOME}/.cache/vllm" \
+        --env "TORCHINDUCTOR_CACHE_DIR=${HOME}/.cache/torchinductor" \
+        --env "TRITON_CACHE_DIR=${HOME}/.cache/triton" \
+        --env "TMPDIR=/tmp" \
         --env "HF_HOME=${TMP_HF_CACHE}" \
         --env OPENAI_API_KEY="${OPENAI_API_KEY}" \
+        --env OPENROUTER_API_KEY="${OPENROUTER_API_KEY}" \
         --env VLLM_API_KEY="inspectai" \
         --env PYTHONNOUSERSITE="1" \
         --env VLLM_LOGGING_LEVEL="DEBUG" \
         --writable-tmpfs \
+        --home "${eval_home}:${HOME}" \
+        --bind "${JOB_TMP}:/tmp" \
         --bind "${REPO_ROOT}:${REPO_ROOT}" \
+        --bind "${EVAL_DIR}:${EVAL_DIR}" \
         --bind "${HF_MERGED}:${TMP_HF_CACHE}" \
         --pwd "$(pwd)/src/eval/tasks/${EVALUATION_TASK}" \
         ${POST_TRAIN_BENCH_CONTAINERS_DIR}/vllm_debug.sif python "evaluate.py" \
@@ -178,6 +202,11 @@ case "${EVALUATION_TASK}" in
 esac
 
 run_evaluation_with_retry 2 "$MAX_TOKENS_ARG"
+
+if [ ! -s "${EVAL_DIR}/metrics.json" ]; then
+    echo "ERROR: evaluation recovery exhausted all attempts without metrics.json" >&2
+    exit 1
+fi
 
 echo $(cat "$EVAL_DIR/z_new_${CLUSTER}_final_eval_${EVAL_COUNTER}.txt")
 
