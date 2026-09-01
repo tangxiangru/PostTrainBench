@@ -115,7 +115,14 @@ if [ -n "$BASE_MODEL_REVISION" ]; then
         --model-snapshot "$BASE_MODEL_SNAPSHOT_CONTAINER"
     )
 fi
-PROMPT=$(python src/eval/general/get_prompt.py "${PROMPT_ARGS[@]}")
+if ! PROMPT=$(python3 src/eval/general/get_prompt.py "${PROMPT_ARGS[@]}"); then
+    echo "ERROR: failed to generate the agent prompt" >&2
+    exit 1
+fi
+if [ -z "${PROMPT//[[:space:]]/}" ]; then
+    echo "ERROR: generated agent prompt is empty" >&2
+    exit 1
+fi
 echo "$PROMPT" > "${EVAL_DIR}/prompt.txt"
 
 bash src/utils/create_timer.sh $NUM_HOURS $JOB_DIR/task/timer.sh
@@ -458,7 +465,7 @@ echo "=== TASK COMPLETE, PARSING AGENT TRACE ==="
 echo "============================================"
 
 # Parse agent trace into human-readable format
-python src/trace_parsing/parse_trace.py --agent "${AGENT}" "${SOLVE_OUT}" -o "${EVAL_DIR}/solve_parsed.txt"
+python3 src/trace_parsing/parse_trace.py --agent "${AGENT}" "${SOLVE_OUT}" -o "${EVAL_DIR}/solve_parsed.txt"
 cp "${EVAL_DIR}/solve_parsed.txt" "${JOB_DIR}/solve_parsed.txt"
 
 echo "============================="
@@ -481,7 +488,7 @@ if [ -f "${JOB_DIR}/task/system_monitor.log" ]; then
     cp "${JOB_DIR}/task/system_monitor.log" "$EVAL_DIR/system_monitor.log"
 fi
 
-python containers/delete_hf_models.py "${JOB_DIR}/task"
+python3 containers/delete_hf_models.py "${JOB_DIR}/task"
 
 cp -r "${JOB_DIR}/task" "$EVAL_DIR/task"
 
