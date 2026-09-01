@@ -119,6 +119,30 @@ fi
 
 source src/commit_utils/set_env_vars.sh
 
+SUBMIT_AS_ROOT="${POST_TRAIN_BENCH_SLURM_SUBMIT_AS_ROOT:-0}"
+RUN_AS_USER="${POST_TRAIN_BENCH_SLURM_RUN_AS_USER:-}"
+case "$SUBMIT_AS_ROOT" in
+    0) ;;
+    1)
+        if [ -z "$RUN_AS_USER" ]; then
+            echo "ERROR: root Slurm submission requires POST_TRAIN_BENCH_SLURM_RUN_AS_USER" >&2
+            exit 1
+        fi
+        if ! RUN_AS_UID="$(id -u "$RUN_AS_USER" 2>/dev/null)"; then
+            echo "ERROR: unknown POST_TRAIN_BENCH_SLURM_RUN_AS_USER=$RUN_AS_USER" >&2
+            exit 1
+        fi
+        if [ "$RUN_AS_UID" = "0" ] || [ "$RUN_AS_UID" != "$(id -u)" ]; then
+            echo "ERROR: root Slurm allocation must drop back to the invoking non-root user" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "ERROR: POST_TRAIN_BENCH_SLURM_SUBMIT_AS_ROOT must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
+
 if [ -n "$REQUESTED_JUDGE_PROFILE" ]; then
     export POST_TRAIN_BENCH_JUDGE_PROFILE="$REQUESTED_JUDGE_PROFILE"
 fi
@@ -222,6 +246,13 @@ COMMAND=(
     "$NUM_GPUS"
     "$EXPERIMENT_NAME"
 )
+
+if [ "$SUBMIT_AS_ROOT" = "1" ]; then
+    # Some sites cannot mint a Slurm credential for directory-backed UIDs
+    # after a controller restart.  Root owns only the allocation; the batch
+    # entrypoint immediately drops to RUN_AS_USER before touching the task.
+    COMMAND=(sudo --preserve-env "${COMMAND[@]}")
+fi
 
 if [ "$DRY_RUN" = "1" ]; then
     printf '%q ' "${COMMAND[@]}"

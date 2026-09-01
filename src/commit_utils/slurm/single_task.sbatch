@@ -5,6 +5,22 @@
 
 set -euo pipefail
 
+# A root-owned allocation is an explicit site workaround, never the task
+# identity.  Preserve the Slurm/GPU environment while resetting HOME, USER,
+# LOGNAME, and the process credentials before any task-side operation.
+if [ "$(id -u)" = "0" ]; then
+    RUN_AS_USER="${POST_TRAIN_BENCH_SLURM_RUN_AS_USER:-}"
+    if [ -z "$RUN_AS_USER" ] || [ "$(id -u "$RUN_AS_USER" 2>/dev/null || true)" = "0" ]; then
+        echo "ERROR: refusing to run PostTrainBench as root" >&2
+        exit 1
+    fi
+    if [ ! -x /usr/sbin/runuser ]; then
+        echo "ERROR: root-owned Slurm allocation requires /usr/sbin/runuser" >&2
+        exit 1
+    fi
+    exec /usr/sbin/runuser --user "$RUN_AS_USER" -- "$0" "$@"
+fi
+
 if [ "$#" -ne 7 ]; then
     echo "Usage: $0 <eval> <agent> <model> <hours> <agent-config> <num-gpus> <experiment-name>" >&2
     exit 2
