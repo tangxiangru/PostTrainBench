@@ -85,32 +85,39 @@ echo "hf_home=${HF_HOME:-<unset>} hub_cache_overrides=cleared"
 echo "isolate_gpus=${POST_TRAIN_BENCH_ISOLATE_GPUS:-<unset>} eval_gpu_reap=${POST_TRAIN_BENCH_EVAL_GPU_REAP:-<unset>}"
 echo "run_task_sha=$(git rev-parse --short HEAD 2>/dev/null) run_task_inode=$(ls -i src/run_task.sh | awk '{print $1}')"
 
-# Echo, then enforce, the identity of the payloads being compared.
+# Echo the identity of every payload being compared, then enforce that the pack is
+# a comparison rather than half of one.
 #
-# The b4 effort-tier batch spent eight a3-node-hours measuring nothing, because
-# claude_autor_{ctl,pt,fd,fx}/solve.sh were all the SAME 2292 bytes (sha256
-# 4c0a7f54...). Four labels, one configuration. Their success rates came out
-# 0/12, 2/11, 2/8 and 3/4, and ctl-vs-fd reads Fisher p=0.0071 -- a p of 0.007
-# between two byte-identical scripts. Nothing downstream could detect this:
-# ptb-results is keyed on the arm NAME, so the duplicate looks like a real arm
-# forever. The only place that can see it is here, before the cells start.
+# An arm is its payload/ -- a whole AutoR checkout on its own branch -- not its
+# solve.sh, which is a thin shared launcher. So the line worth having in the log is
+# the branch and commit each cell actually ran, taken at run time: agents/ is NOT
+# tracked in git (tools/ptb_setup.py installs it), and ptb-results/ is keyed on the
+# arm NAME, so afterwards there is nowhere left that records what a name meant.
+# In b4, fx and fxq turn out to share payload sha 0719436 and rc/rt share ea95d15;
+# that is only visible from a line like this one.
 #
-# agents/ is not tracked in git (tools/ptb_setup.py installs these), so there is
-# no commit to diff against either -- the hash has to be taken at run time.
+# The content hash excludes .git/ and __pycache__/ deliberately: two clones of the
+# same commit differ in pack files and in .pyc timestamps while being the same arm.
 declare -A _ARM_SHA=()
 _dupe=""
 for _a in "${ARMS[@]}"; do
-    _f="agents/${_a}/solve.sh"
-    [ -f "$_f" ] || { echo "FATAL: no such arm: ${_f}" >&2; exit 1; }
-    _h="$(sha256sum "$_f" | cut -c1-16)"
-    echo "arm_payload ${_a} sha=${_h} bytes=$(stat -c%s "$_f") mtime=$(date -r "$_f" --iso-8601=seconds)"
+    _d="agents/${_a}"
+    [ -f "${_d}/solve.sh" ] || { echo "FATAL: no such arm: ${_d}/solve.sh" >&2; exit 1; }
+    _br="$(git -C "${_d}/payload" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '<no-payload>')"
+    _psha="$(git -C "${_d}/payload" rev-parse --short HEAD 2>/dev/null || echo '-')"
+    _h="$(find "${_d}" -type f ! -path '*/.git/*' ! -path '*__pycache__*' \
+              ! -name '*auth*' ! -name 'api_keys.json' -printf '%P\n' 2>/dev/null \
+          | LC_ALL=C sort \
+          | while read -r _f; do sha256sum "${_d}/${_f}" | cut -d' ' -f1; printf '%s\n' "$_f"; done \
+          | sha256sum | cut -c1-16)"
+    echo "arm_payload ${_a} branch=${_br} payload_sha=${_psha} content=${_h} solve_sha=$(sha256sum "${_d}/solve.sh" | cut -c1-16)"
     if [ -n "${_ARM_SHA[$_h]:-}" ] && [ "${_ARM_SHA[$_h]}" != "$_a" ]; then
         _dupe="${_dupe} ${_ARM_SHA[$_h]}==${_a}"
     fi
     _ARM_SHA[$_h]="$_a"
 done
 if [ -n "$_dupe" ]; then
-    echo "FATAL: two arms in this pack have byte-identical solve.sh:${_dupe}" >&2
+    echo "FATAL: two arms in this pack have identical payload content:${_dupe}" >&2
     echo "       They cannot be compared -- any difference between them is noise" >&2
     echo "       wearing two labels. Fix the payload, or drop one arm. Override" >&2
     echo "       with PTB_ALLOW_DUPLICATE_ARMS=1 only to measure the null." >&2
@@ -119,10 +126,19 @@ if [ -n "$_dupe" ]; then
 fi
 
 # A pack is the only unit inside which conditions are held fixed: same node, same
-# hour, same CLI build, same HF cache. In b4 the control ran on 08-30 and every
-# treatment arm on 08-31, and the same script's success rate moved 2/23 -> 5/12
-# (p=0.033) across those two days. So a cross-pack contrast is confounded with
-# the day by construction, and the control has to be IN the pack.
+# hour, same CLI build, same HF cache. In b4 the arms were nested inside packs --
+# five packs, two arms each, and the control in neither of the days the treatment
+# arms ran. That makes the PACK the unit of randomisation, and with 2 treatment
+# packs against 3 others the smallest attainable p-value is 0.10: the batch could
+# not have reached significance however large the effect. (The pack really is a
+# unit and not a formality -- fx ran in two packs on one day for 0/4 and 2/4.)
+#
+# Interleaving arms across GPUs inside a pack, which this launcher already does,
+# does not help; the arm has to be interleaved across PACKS. Eight arms x 1 GPU x
+# five packs costs exactly the same GPU-hours as two arms x 4 GPUs x five packs,
+# gives 5 replicates per arm instead of 4, and turns the pack from a confound into
+# a block you can subtract. Requiring the control in every pack is the cheap half
+# of that.
 CONTROL_ARM="${PTB_CONTROL_ARM:-claude_autor_ctl}"
 case " ${ARMS[*]} " in
     *" ${CONTROL_ARM} "*) echo "control_arm=${CONTROL_ARM} in_pack=yes" ;;

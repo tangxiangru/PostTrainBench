@@ -578,83 +578,90 @@ the decode census above spreads cells of one arm from 0.0485 to 0.4284, so a sin
 contrast here sits well inside its own noise. Six cells per arm is the minimum worth
 reading, and the comparison to make is the count above the floor, not the mean.
 
-# The 1 h tier measured nothing, because four of its arms are one script (2026-09-01)
+# The 1 h tier could not have reached significance, whatever the effect (2026-09-01)
 
-The count-above-the-floor reading above is the right one. Applied to the whole 1 h tier it
-retracts the tier.
+The count-above-the-floor reading above is the right one. Applied to the whole 1 h tier,
+it says the tier is unreadable — not because the arms are weak, but because of how the
+cells were distributed over packs.
 
 Threshold, derived rather than chosen: the pooled 1 h scores (n=65) have their largest gap
-at **0.549 → 0.636**, so "worked" is > 0.5925. The base model is 0.1198. Nothing sits
-between 0.472 and 0.535 either — the distribution is two clumps, a cell produces a working
-fine-tune or it produces something at or under the untrained model.
+at **0.549 → 0.636**, so "worked" is > 0.5925. The base model is 0.1198, and nothing sits
+between 0.472 and 0.535 either. The distribution is two clumps: a cell produces a working
+fine-tune, or it produces something at or under the untrained model. Means are the wrong
+summary for it; successes-out-of-cells is the right one.
 
-## Four labels, one payload
+## The control never ran on a day any treatment arm ran
 
-`agents/claude_autor_{ctl,pt,fd,fx}/solve.sh` are the **same 2292 bytes**, sha256
-`4c0a7f54a2741afd`. All four mtimes (08-30 07:50, 07:50, 19:03, 10:37) precede every job
-that used them, so the identity held at run time. `agents/` is not tracked in git, so there
-is no commit to diff — the hash has to be taken while the job runs.
+| arm | 08-30 | 08-31 | payload branch | payload sha |
+|---|---|---|---|---|
+| ctl | 0/12 | — | `main` | f36dfd5 |
+| pt | 2/11 | — | `ptb/s2-tiers` | 1243fdf |
+| fd | — | 3/4 | `ptb/s2-decoding` | 575664a |
+| fx | — | 2/8 | `ptb/s2-tiers` | 0719436 |
+| fxq | — | 0/4 | `ptb/s2-tiers` | 0719436 |
+| dg | — | 0/4 | `ptb/gate-on-tiers` | dcf487b |
+| dgc | — | 1/4 | `ptb/gate-on-tiers` | dcf487b |
+| rt | — | 5/8 | `ptb/arm-build` | ea95d15 |
+| rc | — | 6/8 | `ptb/arm-build` | ea95d15 |
 
-| label | worked / cells | Wilson 95% | jobs |
-|---|---|---|---|
-| ctl | 0/12 (0%) | [0.00, 0.24] | 82647, 82648, 82822, 82823 |
-| pt | 2/11 (18%) | [0.05, 0.48] | 82648, 82822, 82823 |
-| fx | 2/8 (25%) | [0.07, 0.59] | 83997, 84425 |
-| fd | 3/4 (75%) | [0.30, 0.95] | 83997 |
+The table separates perfectly. So the headline anyone would write from the arm means —
+`rc` 6/8 vs `ctl` 0/12, Fisher p = 0.00072 — is a comparison between two calendar days.
+There is no same-day contrast against the control anywhere in this batch.
 
-**`ctl` vs `fd` is Fisher p = 0.0071 between two byte-identical scripts.** That is this
-design's false-positive rate at these n, measured rather than assumed. Pooled, the one
-configuration is 7/35 = 20%.
+The arms themselves are real: nine distinct payload contents over five AutoR branches.
+(An arm is its `payload/`, a whole AutoR checkout; `solve.sh` is a thin launcher and
+`ctl`, `pt`, `fd` and `fx` all share the same 2292 bytes of it. Hashing `solve.sh` says
+nothing about whether two arms differ — `fx` and `fxq` are the pair worth noticing, and
+they share a payload *commit*, 0719436.)
 
-## The variable that does separate is the calendar
+## The pack is the unit, and there are five of them
 
-Within that single script, split by day:
+Arms are nested two-per-pack, four GPUs each:
 
-| day | worked / cells | labels present |
+| pack | arms | worked / 8 |
 |---|---|---|
-| 08-30 | 2/23 (8.7%) | ctl, pt |
-| 08-31 | 5/12 (41.7%) | fd, fx |
+| 83997 | fd, fx | 3 |
+| 84425 | fx, fxq | 2 |
+| 84437 | dg, dgc | 1 |
+| 84363 | rt, rc | 5 |
+| 84364 | rt, rc | 6 |
 
-**Fisher p = 0.033.** Same bytes, same task, same model, same agent_config — the success
-rate quadrupled overnight. Whatever moved (CLI build, HF cache contents, upstream `src/`)
-is uncontrolled and is currently the largest effect on this board.
+The pack is a real source of variance and not a formality: **`fx` ran in two packs on the
+same day, one payload, and went 0/4 then 2/4.** So the treatment contrast has to be taken
+with the pack as the unit. Exact permutation over which 2 of the 5 packs are `rc`/`rt`:
+observed difference 3.50 successes per pack, **p = 1/10 = 0.10**, which is the most extreme
+of the ten arrangements.
 
-And `ctl` ran **only** on 08-30 while `rc`, `rt`, `dgc`, `dg`, `fxq` ran **only** on 08-31.
-So the headline anyone would write from the arm means — `rc` 6/8 vs `ctl` 0/12, Fisher
-p = 0.00072 — is a comparison between two days, not between two recipes.
+**0.10 is the floor.** With 2 treatment packs against 3 others there are only ten
+assignments, so no effect of any size could have produced p < 0.10. The batch was
+unable to reach significance before the first cell started.
 
-## Restricted to same-day, nothing is significant
+Taken at the cell level instead, `rc`+`rt` 11/16 vs every other 08-31 arm 6/24 reads
+Fisher p = 0.0095 — that number is what the nesting manufactures, and it should not be
+quoted.
 
-08-31 only, against the identical-script family's own 5/12 on that same day:
+## The fix is free
 
-| arm | worked / cells | Wilson 95% | Fisher p |
-|---|---|---|---|
-| rc | 6/8 (75%) | [0.41, 0.93] | 0.197 |
-| rt | 5/8 (63%) | [0.31, 0.86] | 0.650 |
-| rc+rt | 11/16 (69%) | [0.44, 0.86] | 0.250 |
-| dgc | 1/4 (25%) | [0.05, 0.70] | 1.000 |
-| dg | 0/4 (0%) | [0.00, 0.49] | 0.245 |
-| fxq | 0/4 (0%) | [0.00, 0.49] | 0.245 |
+Interleaving arms across GPUs *within* a pack, which this launcher already does, does not
+address this. The arm has to be interleaved across **packs**:
 
-**No 1 h arm is demonstrated.** `rc` is the best point estimate and it is not separable
-from a script that is definitionally doing nothing different. Detecting the observed
-75% vs 42% at 80% power needs **≈34 cells per arm** — roughly four full packs each, against
-the one pack each they got.
+- as run: 5 packs × 2 arms × 4 GPUs → 4 replicates/arm, arm confounded with pack
+- instead: 5 packs × 8 arms × 1 GPU → **5 replicates/arm**, every arm in every pack
 
-Two confounds that are clean, checked rather than assumed: success by GPU index is flat
-(1/8 to 3/9 across g0–g7, no g0 advantage, so the `CUDA_VISIBLE_DEVICES` renumbering bug is
-not behind this), and the arms were correctly interleaved across GPUs *within* each pack.
-The design failed one level up — between packs, not inside them.
+Identical GPU-hours, one more replicate per arm, and the pack becomes a block to subtract
+rather than a confound. `rc` remains the best point estimate (6/8, Wilson [0.41, 0.93]) and
+is worth re-running that way; detecting 75% vs 25% at 80% power needs about **17 cells per
+arm**, so roughly three blocked rounds.
 
-## What is fixed
+## What is enforced now
 
-`ptb_ops/ptb_pack.sbatch` now refuses, before any cell starts:
+`ptb_ops/ptb_pack.sbatch`, before any cell starts:
 
-- a pack containing two arms whose `solve.sh` are byte-identical
-  (`PTB_ALLOW_DUPLICATE_ARMS=1` overrides, for deliberately measuring the null);
-- a pack with no in-pack control (`PTB_CONTROL_ARM`, default `claude_autor_ctl`;
-  `PTB_NO_CONTROL=1` overrides).
-
-It also echoes `arm_payload <arm> sha=… bytes=… mtime=…` for every arm, so the duplicate is
-visible in the log even when an override is used. Nothing downstream could have caught this:
-`ptb-results/` is keyed on the arm *name*, so a duplicate looks like a real arm forever.
+- logs `arm_payload <arm> branch= payload_sha= content= solve_sha=` for every arm, so the
+  meaning of an arm name survives the run — `ptb-results/` is keyed on the name and
+  `agents/` is untracked, so nothing else records it;
+- refuses two arms with identical payload content (`PTB_ALLOW_DUPLICATE_ARMS=1` overrides,
+  for deliberately measuring the null);
+- refuses a pack with no in-pack control (`PTB_CONTROL_ARM`, default `claude_autor_ctl`;
+  `PTB_NO_CONTROL=1` overrides). The content hash skips `.git/` and `__pycache__/`: two
+  clones of one commit differ there while being the same arm.
