@@ -276,7 +276,7 @@ build_judge_prompt() {
     local args=(--judge "$judge_name" --benchmark-id "$benchmark_id" --model "$model_hf")
     [ -n "$agent" ] && args+=(--agent "$agent")
     [ -n "$agent_config" ] && args+=(--agent-config "$agent_config")
-    python "$JUDGES_DIR/get_judge_prompt.py" "${args[@]}"
+    python3 "$JUDGES_DIR/get_judge_prompt.py" "${args[@]}"
 }
 
 # run_judge_exec_codex <job_dir> <job_tmp> <output_json> <prompt>
@@ -508,7 +508,7 @@ collect_judge_output() {
     local out_base="judge_output_${JUDGE_OUTPUT_ID}${suffix}"
     local judgement="$out_dir/judgement_${JUDGE_OUTPUT_ID}${suffix}.json"
 
-    python "$JUDGES_REPO_ROOT/src/trace_parsing/parse_trace.py" --agent "$PTB_JUDGE_BACKEND" "$out_dir/${out_base}.json" -o "$out_dir/${out_base}.txt"
+    python3 "$JUDGES_REPO_ROOT/src/trace_parsing/parse_trace.py" --agent "$PTB_JUDGE_BACKEND" "$out_dir/${out_base}.json" -o "$out_dir/${out_base}.txt"
 
     if [ -f "$job_dir/task/judgement.json" ]; then
         cp "$job_dir/task/judgement.json" "$judgement"
