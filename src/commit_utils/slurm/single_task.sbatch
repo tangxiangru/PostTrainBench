@@ -122,9 +122,10 @@ case "$GPU_MODE" in
             echo "ERROR: Slurm GRES mode did not set CUDA_VISIBLE_DEVICES" >&2
             exit 1
         fi
-        # Slurm normally exposes physical indices in SLURM_JOB_GPUS. Keep the
-        # value for host-side, allocation-scoped nvidia-smi cleanup; the
-        # container itself inherits Slurm's device cgroup and CUDA visibility.
+        # Slurm exposes physical indices in SLURM_JOB_GPUS while the devices
+        # cgroup remaps the one visible GPU to logical index 0. Keep the
+        # physical value for provenance and as proof that the allocation has a
+        # selector; host cleanup scopes nvidia-smi via the devices cgroup.
         export POST_TRAIN_BENCH_VISIBLE_GPUS="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES}}"
         ;;
     manual)

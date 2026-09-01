@@ -13,7 +13,14 @@ ptb_reap_allocated_gpu_processes() {
         *) echo "ERROR: POST_TRAIN_BENCH_EVAL_GPU_REAP must be own or none" >&2; return 1 ;;
     esac
     if [ -n "$gpu_selector" ]; then
-        device_args=(-i "$gpu_selector")
+        # Under Slurm GRES, the devices cgroup exposes only this job's physical
+        # GPU and NVML remaps it to logical index 0.  SLURM_JOB_GPUS keeps the
+        # physical index, so passing it to ``nvidia-smi -i`` misses processes
+        # whenever the allocation is not physical GPU 0.  Query every
+        # cgroup-visible GPU instead; the cgroup itself is the scope boundary.
+        if [ "${POST_TRAIN_BENCH_SLURM_GPU_MODE:-}" != "gres" ]; then
+            device_args=(-i "$gpu_selector")
+        fi
     elif [ "${POST_TRAIN_BENCH_SLURM_GPU_MODE:-}" = "gres" ]; then
         echo "ERROR: refusing GPU cleanup without an allocation-scoped selector" >&2
         return 1

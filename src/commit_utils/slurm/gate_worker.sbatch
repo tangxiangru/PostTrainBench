@@ -23,7 +23,16 @@ ALLOCATED="${SLURM_JOB_GPUS:?Slurm did not provide SLURM_JOB_GPUS}"
 export POST_TRAIN_BENCH_VISIBLE_GPUS="$ALLOCATED"
 export POST_TRAIN_BENCH_SLURM_GPU_MODE=gres
 IMAGE="${POST_TRAIN_BENCH_CONTAINERS_DIR}/${POST_TRAIN_BENCH_CONTAINER_NAME}.sif"
-UUID="$(nvidia-smi -i "$ALLOCATED" --query-gpu=uuid --format=csv,noheader | tr -d '[:space:]')"
+# Slurm's devices cgroup exposes only the allocated physical GPU and remaps it
+# to logical index 0.  SLURM_JOB_GPUS retains the physical index, so using it
+# with ``nvidia-smi -i`` fails for every allocation except physical GPU 0.
+mapfile -t VISIBLE_UUIDS < <(
+    nvidia-smi --query-gpu=uuid --format=csv,noheader \
+        | sed -e 's/[[:space:]]//g' -e '/^$/d'
+)
+[ "${#VISIBLE_UUIDS[@]}" -eq 1 ] \
+    || { echo "ERROR: expected exactly one cgroup-visible GPU, got ${#VISIBLE_UUIDS[@]}" >&2; exit 1; }
+UUID="${VISIBLE_UUIDS[0]}"
 printf '%s\n' "$UUID" > "$GATE_DIR/${SLURM_JOB_ID}.uuid"
 {
     echo "job_id=${SLURM_JOB_ID}"
