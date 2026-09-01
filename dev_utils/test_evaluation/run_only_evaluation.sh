@@ -4,10 +4,18 @@ export EVAL_DIR="$2"
 export HOME="$3"
 export CLUSTER="$4"
 
-export TMP_SUBDIR="/tmp/posttrain_container_${EVALUATION_TASK}_${RANDOM_UUID}"
+RANDOM_UUID="${SLURM_JOB_ID:-$(uuidgen)}"
+RECOVERY_SCRATCH_ROOT="${POST_TRAIN_BENCH_SCRATCH_DIR:-${TMPDIR:-/tmp}}"
+export TMP_SUBDIR="${RECOVERY_SCRATCH_ROOT%/}/posttrain_container_${EVALUATION_TASK}_${RANDOM_UUID}"
 export HF_MERGED="${TMP_SUBDIR}/merged_huggingface"
 mkdir -p "${TMP_SUBDIR}"
 mkdir -p "${HF_MERGED}"
+
+cleanup() {
+    fusermount -uz "${TMP_SUBDIR}/merged_huggingface" 2>/dev/null || true
+    rm -rf -- "${TMP_SUBDIR}"
+}
+trap cleanup EXIT
 
 source src/commit_utils/set_env_vars.sh
 
@@ -51,15 +59,13 @@ echo "================================"
 
 export REPO_ROOT="$(pwd)"
 
-export TMP_HF_CACHE="/tmp/hf_cache_90afd1"
+export TMP_HF_CACHE="${TMP_SUBDIR}/hf_cache"
 
 export EVAL_COUNTER=0
 
 run_evaluation() {
     local max_tokens_arg="$1"
     local eval_num="$2"
-    nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9
-    sleep 5
     with_huggingface_overlay apptainer exec \
         --nv \
         --env "HF_HOME=${TMP_HF_CACHE}" \
