@@ -757,3 +757,68 @@ Restricted to decode-matched cells the head-to-head is vertex 0.8127 (n=6) again
   repo yields a checkout that looks complete and has no test data; that is how
   jobs 84279 and 84280 each took an exclusive eight-GPU node and lost all seven cells
   to one error line at the 4.5-minute mark.
+
+# 86742 landed: equalise the decode and the b4 ranking inverts (2026-09-01)
+
+Job 86742 finished COMPLETED in 2:34:10, exit 0. All 95 cells now carry a
+`metrics_greedy.json` — the 40 b4 cells and the whole ten-hour tier re-scored off
+symlink shadows under one fixed greedy decode, same weights, `ptb-results/` untouched.
+
+## The mechanism, at n=40 and with nothing left to argue about
+
+    cells that already shipped temperature=0.0   shift +0.0002   sd 0.0038   n=22
+    cells that did not                           shift +0.3889   sd 0.1610   n=18
+
+The re-score is a no-op for every cell that was already being graded greedily. Its
+sd of 0.0038 is the re-scoring noise floor, so the +0.3889 on the other eighteen is
+not noise, and it is not a property of those cells' training.
+
+## The ranking inverts
+
+    arm    sampled            greedy             shift
+    rc     #1  0.5937         #6  0.5940         +0.0003
+    rt     #2  0.5601         #7  0.5612         +0.0011
+    fd     #3  0.5224         #2  0.6738         +0.1514
+    fx     #4  0.3651         #3  0.6131         +0.2479
+    dgc    #5  0.3254         #4  0.5970         +0.2716
+    dg     #6  0.2993         #1  0.6816         +0.3823
+    fxq    #7  0.1486         #5  0.5961         +0.4475
+
+Spearman rho between the two orderings is **−0.464**. `rc` and `rt` — the two arms
+the previous sections called the clean winners at 6/8 and 5/8 — come **last**. They
+gained nothing from the re-score because they had nothing to gain: they were already
+setting the flag. `dg`, which scored 0/4 and sat sixth, is first.
+
+**Every b4 arm claim in the earlier sections of this document is withdrawn.** Not
+weakened — reversed.
+
+## And after equalising there is no arm effect at all
+
+35 of 40 cells produced a model above the untrained base (0.3328); those 35 average
+**0.6654, sd 0.0498**. Conditional on producing one:
+
+    dg  0.6816 (4)   dgc 0.6806 (3)   fd  0.6738 (4)   fx  0.6845 (7)
+    fxq 0.6798 (3)   rc  0.6519 (7)   rt  0.6329 (7)
+
+Seven arms inside a 5.2-point band; permutation test on the arm factor, 20,000
+draws, **p = 0.728**. The five that failed are 0.059, 0.113, 0.189, 0.345, 0.346 —
+the last two are the base weights shipped unchanged, the first three are below the
+model the run started from.
+
+**At the one-hour budget every arm that produces a model produces the same model.**
+The board's entire spread is two binary facts: did the run ship trained weights, and
+did it write `temperature: 0.0`.
+
+## The ten-hour tier moved 1 point and still does not resolve
+
+    sn      0.7979 -> 0.7985   (+0.0007)      sc  0.7864 -> 0.7854  (-0.0009)
+    vertex  0.8182 -> 0.8287   (+0.0106)      sq  0.7043 -> 0.7028  (-0.0015)
+
+AutoR's ten-hour arms were already greedy, so they do not move; `claude_vertex` gains
+0.0106 from its three non-greedy cells. Paired by slot inside 84998/84999:
+
+    vertex - sn = +0.0191   t = 1.33   95% CI [-0.0149, +0.0532]   vertex takes 7/8
+
+Equalising moved the pair from a dead tie (−0.0070, t −0.37, vertex 6/8) to a
+1.9-point lead for `claude_vertex` that still does not clear. Report it as unresolved
+with the point estimate against AutoR, not as a tie.
