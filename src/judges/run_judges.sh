@@ -83,6 +83,12 @@ if [ ! -d "$RESULT_DIR/task" ]; then
 fi
 
 source "$JUDGES_REPO_ROOT/src/commit_utils/set_env_vars.sh"
+if [ -n "${POST_TRAIN_BENCH_APPTAINER_BIN:-}" ]; then
+    export PATH="$(dirname "$POST_TRAIN_BENCH_APPTAINER_BIN"):${PATH}"
+fi
+if [ -n "${POST_TRAIN_BENCH_APPTAINER_LIBRARY_PATH:-}" ]; then
+    export LD_LIBRARY_PATH="${POST_TRAIN_BENCH_APPTAINER_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
 if [ -n "$REQUESTED_PROFILE" ]; then
     export POST_TRAIN_BENCH_JUDGE_PROFILE="$REQUESTED_PROFILE"
 fi
@@ -163,6 +169,21 @@ prepare_judge_sandbox "$JOB_DIR" "$BENCHMARK" "$RESULT_DIR/final_model/config.js
 # Set up profile-specific isolated config/auth.
 setup_judge_auth "$JOB_DIR"
 
+JUDGE_LOCK_HELD=0
+if [ "$JUDGE_PROFILE" = "official" ]; then
+    JUDGE_LOCK_FILE="${POST_TRAIN_BENCH_JUDGE_LOCK_FILE:-}"
+    if [ -z "$JUDGE_LOCK_FILE" ]; then
+        echo "ERROR: POST_TRAIN_BENCH_JUDGE_LOCK_FILE is required for official judges" >&2
+        exit 1
+    fi
+    mkdir -p "$(dirname "$JUDGE_LOCK_FILE")"
+    exec 9>"$JUDGE_LOCK_FILE"
+    echo "Waiting for official judge auth lock: $JUDGE_LOCK_FILE"
+    flock -x 9
+    JUDGE_LOCK_HELD=1
+    echo "Official judge auth lock acquired."
+fi
+
 # Remove any pre-existing per-judge output files in the result dir for the
 # judges we are about to rerun, so stale values from earlier runs can't be
 # confused with fresh output when a CLI fails. Leave the skipped judges'
@@ -191,6 +212,12 @@ for JUDGE_NAME in "${JUDGES[@]}"; do
 
     collect_judge_output "$JOB_DIR" "$RESULT_DIR" "_rerun" 1
 done
+
+if [ "$JUDGE_LOCK_HELD" = "1" ]; then
+    flock -u 9
+    exec 9>&-
+    echo "Official judge auth lock released."
+fi
 
 echo ""
 echo "Judges completed successfully: ${JUDGES[*]}"
