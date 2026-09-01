@@ -168,6 +168,7 @@ def init(args: argparse.Namespace) -> None:
             "node": os.environ.get("SLURMD_NODENAME") or command("hostname"),
             "partition": os.environ.get("SLURM_JOB_PARTITION"),
             "job_gpus": os.environ.get("SLURM_JOB_GPUS"),
+            "allocated_gpu_ids": os.environ.get("POST_TRAIN_BENCH_ALLOCATED_GPUS"),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "cpus_per_task": os.environ.get("SLURM_CPUS_PER_TASK"),
             "memory_per_node": os.environ.get("SLURM_MEM_PER_NODE"),

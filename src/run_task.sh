@@ -571,6 +571,13 @@ source src/utils/gpu_reap.sh
 run_evaluation() {
     local max_tokens_arg="$1"
     local eval_num="$2"
+    local eval_home="${JOB_TMP}/eval-home"
+    local eval_cache="${eval_home}/.cache"
+    mkdir -p \
+        "${eval_cache}/vllm" \
+        "${eval_cache}/torchinductor" \
+        "${eval_cache}/triton" \
+        "${eval_home}/.config"
     ptb_reap_allocated_gpu_processes
     sleep 5
     with_huggingface_overlay apptainer exec \
@@ -580,12 +587,20 @@ run_evaluation() {
         --pid \
         --no-init \
         --env "CUDA_VISIBLE_DEVICES=${POST_TRAIN_BENCH_VISIBLE_GPUS:-${CUDA_VISIBLE_DEVICES:-}}" \
+        --env "HOME=${HOME}" \
+        --env "XDG_CACHE_HOME=${HOME}/.cache" \
+        --env "XDG_CONFIG_HOME=${HOME}/.config" \
+        --env "VLLM_CACHE_ROOT=${HOME}/.cache/vllm" \
+        --env "TORCHINDUCTOR_CACHE_DIR=${HOME}/.cache/torchinductor" \
+        --env "TRITON_CACHE_DIR=${HOME}/.cache/triton" \
+        --env "TMPDIR=/tmp" \
         --env "HF_HOME=${TMP_HF_CACHE}" \
         --env OPENAI_API_KEY="${OPENAI_API_KEY}" \
         --env OPENROUTER_API_KEY="${OPENROUTER_API_KEY}" \
         --env VLLM_API_KEY="inspectai" \
         --env PYTHONNOUSERSITE="1" \
         --writable-tmpfs \
+        --home "${eval_home}:${HOME}" \
         --bind "${JOB_TMP}:/tmp" \
         --bind "${REPO_ROOT}:${REPO_ROOT}" \
         --bind "${EVAL_DIR}:${EVAL_DIR}" \

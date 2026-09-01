@@ -123,10 +123,12 @@ case "$GPU_MODE" in
             exit 1
         fi
         # Slurm exposes physical indices in SLURM_JOB_GPUS while the devices
-        # cgroup remaps the one visible GPU to logical index 0. Keep the
-        # physical value for provenance and as proof that the allocation has a
-        # selector; host cleanup scopes nvidia-smi via the devices cgroup.
-        export POST_TRAIN_BENCH_VISIBLE_GPUS="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES}}"
+        # cgroup remaps the allocated set to logical indices beginning at 0.
+        # Containers must receive the logical CUDA selector; passing a physical
+        # nonzero id makes the only cgroup-visible GPU disappear. Keep the
+        # physical allocation separately for provenance.
+        export POST_TRAIN_BENCH_ALLOCATED_GPUS="${SLURM_JOB_GPUS:-}"
+        export POST_TRAIN_BENCH_VISIBLE_GPUS="${CUDA_VISIBLE_DEVICES}"
         ;;
     manual)
         GPU_IDS="$(seq -s, 0 $((NUM_GPUS - 1)))"
