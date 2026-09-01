@@ -665,3 +665,95 @@ arm**, so roughly three blocked rounds.
 - refuses a pack with no in-pack control (`PTB_CONTROL_ARM`, default `claude_autor_ctl`;
   `PTB_NO_CONTROL=1` overrides). The content hash skips `.git/` and `__pycache__/`: two
   clones of one commit differ there while being the same arm.
+
+# The one-hour board measures a decode flag, not a training recipe (2026-09-01)
+
+The section above says the b4 design could not have reached significance. That is
+still true and it is now the *second* problem. The first is that the outcome
+variable is not measuring the treatment.
+
+`src/eval/tasks/gsm8k/evaluate.py` passes no temperature, so vLLM samples under
+whatever `generation_config.json` the cell delivered in `final_model/`. That file is
+part of what an arm ships. Across the 95 scored cells, 50 ship `temperature: 0.0`,
+44 ship a config with no decode keys at all, and one ships `temperature: 1.0`.
+
+    ships temperature=0.0    n=68   mean 0.5901
+    ships anything else      n=27   mean 0.2290
+
+## On b4 the flag is the result
+
+Cross-tabulating the 40 b4 cells against the 0.5925 success threshold derived above:
+
+                    win   lose
+      temp=0.0       17      5
+      otherwise       0     18      Fisher exact p = 3.35e-07
+
+Not one of the eighteen cells without the flag ever cleared the bar. And the flag is
+almost perfectly determined by the arm:
+
+    arm    ships temp=0.0    "wins"
+    rc          8/8           6/8
+    rt          7/8           5/8
+    fd          3/4           3/4
+    fx          3/8           2/8
+    dgc         1/4           1/4
+    dg          0/4           0/4
+    fxq         0/4           0/4
+
+Within the 22 cells that all shipped `temperature: 0.0`, 17 land in a band of
+**mean 0.6757, sd 0.0133**, and the arms are not separable inside it (fd 0.668,
+dgc 0.683, rt's winners 0.68, rc's winners 0.68). The other 5 are 0.111, 0.187,
+0.466, 0.535, 0.549.
+
+Across all nine one-hour arms, the arm mean against the fraction of that arm's cells
+shipping the flag gives **Pearson r = 0.9558, r² = 0.914** — 91% of the between-arm
+variance on the one-hour board is one boolean. The fitted line is: an arm that never
+writes it scores 0.211, an arm that always writes it scores 0.612.
+
+## The greedy re-score says the same thing from the other direction
+
+Job 84024 re-scored 27 b3 cells under one fixed greedy decode, same weights, nothing
+else changed (`ptb_ops/ptb_greedy_board.sbatch`, shadows under `/rmeng_data/robtang/ptb-greedy`).
+Equalising the decode moved the mean **+0.2912** (median +0.2237, max +0.6368). The
+four cells that moved by ~0 (−0.0015, +0.0015, +0.0030, +0.0068) are exactly the four
+that had already shipped a greedy config — the mechanism is confirmed, not assumed.
+
+After equalising, the board has two states and nothing between them. The untrained
+base model scores **0.3328** greedy:
+
+    ctl  n=12   at-or-below base: 7   above: 5    the 5 average 0.6893 (sd 0.0182)
+    pt   n=11   at-or-below base: 3   above: 8    the 8 average 0.6952 (sd 0.0235)
+
+Ten of twenty-three cells land within ±0.02 of the untrained model and two land
+*below* it. A one-hour gsm8k score carries about one bit: did this run ship trained
+weights, or the base weights it started from.
+
+**So the +0.1839 "pins and tiers wins" headline is a reliability effect, not a recipe
+effect** — pt produced a model at all 8/11 times against ctl's 5/12 (Fisher p = 0.21),
+and conditional on producing one the two arms differ by 0.006 against a within-arm sd
+of ~0.02. Under the equalised decode the arm gap is +0.1280, Welch t = 1.66. It was
++0.1839, t = 2.38, under the un-equalised one. The decode nuisance is larger than the
+signal it sits on.
+
+## What survives
+
+The ten-hour tier is not contaminated this way. `sn` ships the flag 8/8, `sc` 4/4,
+`sk` 1/1, `sq` 1/1; `claude_vertex` 6/8 inside the paired packs, and its two
+non-setters are 0.7157 and 0.8469, one either side, so they do not move its mean.
+Restricted to decode-matched cells the head-to-head is vertex 0.8127 (n=6) against
+`sn` 0.7979 (n=8) — the same tie the full n=8 pairing gives. That comparison stands.
+
+## What is enforced and what is running
+
+- `ptb_pack.sbatch` now prints `cell_decode gpu= arm= temperature= top_p= top_k=
+  do_sample=` beside every `cell_exit`, so the largest effect on the board is in the
+  pack log instead of buried in `final_model/` for someone to find later.
+- Job **86742** re-scores every cell that has no `metrics_greedy.json` yet — the 40
+  b4 cells and the ten-hour tier — under the same fixed greedy decode. It is
+  resumable and skips what is already done. Until it lands, no b4 arm contrast should
+  be quoted, including the ones in the section above.
+- `ptb_pack.sbatch` also now refuses to start if `src/eval/tasks/$TASK/test_data.json`
+  is missing. `**/test_data.json` is gitignored by design, so a `git clone` of this
+  repo yields a checkout that looks complete and has no test data; that is how
+  jobs 84279 and 84280 each took an exclusive eight-GPU node and lost all seven cells
+  to one error line at the 4.5-minute mark.

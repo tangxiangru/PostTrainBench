@@ -151,6 +151,20 @@ case " ${ARMS[*]} " in
         echo "       PTB_NO_CONTROL=1 -- continuing without an in-pack control." >&2 ;;
 esac
 
+# `**/test_data.json` is gitignored on purpose -- it is the task's test set -- so a
+# `git clone` of this repo produces a checkout that looks complete and has no test data.
+# run_task.sh only notices once it is already inside the cell, which is how 84279 and
+# 84280 each took an exclusive eight-GPU node and lost all seven cells to one line at
+# the 4.5-minute mark. Check it here, before the allocation is spent.
+_TD="src/eval/tasks/${TASK}/test_data.json"
+if [ ! -s "${_TD}" ]; then
+    echo "FATAL: ${_TD} is missing or empty in ${REPO_ROOT}" >&2
+    echo "       It is gitignored, so a fresh clone never has it. Copy it from a" >&2
+    echo "       working checkout or re-run tools/ptb_setup.py before submitting." >&2
+    exit 1
+fi
+echo "test_data=${_TD} bytes=$(stat -c%s "${_TD}")"
+
 SCRATCH="${POST_TRAIN_BENCH_TMP_ROOT:-/tmp}"
 mkdir -p "$SCRATCH" || { echo "FATAL: cannot create $SCRATCH on $(hostname)" >&2; exit 1; }
 [ -w "$SCRATCH" ] || { echo "FATAL: $SCRATCH is not writable on $(hostname)" >&2; exit 1; }
@@ -186,6 +200,22 @@ for (( gpu=0; gpu<N; gpu++ )); do
     wait "${PIDS[$gpu]}"
     rc=$?
     echo "cell_exit gpu=${gpu} arm=${ARMS[$gpu]} cell=${SLURM_JOB_ID}_g${gpu} rc=${rc}"
+    # What decode did this cell ship? `evaluate.py` passes no temperature, so vLLM uses
+    # whatever the delivered generation_config.json says, and that single flag explains
+    # r^2 = 0.914 of the between-arm variance on the one-hour board (nine arms, n=64):
+    # an arm that never writes temperature=0.0 averages 0.21, one that always does, 0.61.
+    # It is the largest effect on the board and until now it was invisible until someone
+    # went digging in final_model/ after the fact. Print it next to the exit code.
+    _gc="$(ls -1 "${POST_TRAIN_BENCH_RESULTS_DIR:-/rmeng_data/robtang/ptb-results}"/*/"${TASK}"_*_"${SLURM_JOB_ID}_g${gpu}"/final_model/generation_config.json 2>/dev/null | head -1)"
+    if [ -n "${_gc}" ]; then
+        echo "cell_decode gpu=${gpu} arm=${ARMS[$gpu]} $(python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(" ".join(f"{k}={d.get(k)}" for k in ("temperature","top_p","top_k","do_sample")))
+' "${_gc}" 2>/dev/null || echo 'unparseable')"
+    else
+        echo "cell_decode gpu=${gpu} arm=${ARMS[$gpu]} no generation_config.json shipped"
+    fi
     [ "$rc" -eq 0 ] || rc_all=1
 done
 
