@@ -587,7 +587,6 @@ run_evaluation() {
         --pid \
         --no-init \
         --env "CUDA_VISIBLE_DEVICES=${POST_TRAIN_BENCH_VISIBLE_GPUS:-${CUDA_VISIBLE_DEVICES:-}}" \
-        --env "HOME=${HOME}" \
         --env "XDG_CACHE_HOME=${HOME}/.cache" \
         --env "XDG_CONFIG_HOME=${HOME}/.config" \
         --env "VLLM_CACHE_ROOT=${HOME}/.cache/vllm" \

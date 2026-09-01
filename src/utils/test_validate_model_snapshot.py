@@ -34,6 +34,21 @@ class ValidateModelSnapshotTest(unittest.TestCase):
     def test_complete_snapshot_passes(self) -> None:
         self.assertEqual(validate(self.snapshot), [])
 
+    def test_complete_monolithic_snapshot_passes(self) -> None:
+        (self.snapshot / "model.safetensors.index.json").unlink()
+        (self.snapshot / "model-00001-of-00001.safetensors").unlink()
+        (self.snapshot / "model.safetensors").write_bytes(b"weights")
+        self.assertEqual(validate(self.snapshot), [])
+
+    def test_empty_monolithic_snapshot_fails(self) -> None:
+        (self.snapshot / "model.safetensors.index.json").unlink()
+        (self.snapshot / "model-00001-of-00001.safetensors").unlink()
+        (self.snapshot / "model.safetensors").write_bytes(b"")
+        self.assertIn(
+            "missing or empty model.safetensors and model.safetensors.index.json",
+            validate(self.snapshot),
+        )
+
     def test_missing_shard_fails(self) -> None:
         (self.snapshot / "model-00001-of-00001.safetensors").unlink()
         self.assertIn(

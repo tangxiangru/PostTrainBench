@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail closed unless a pinned Hugging Face snapshot has all indexed weights."""
+"""Fail closed unless a pinned Hugging Face snapshot has complete model weights."""
 
 from __future__ import annotations
 
@@ -12,10 +12,15 @@ def validate(snapshot: Path) -> list[str]:
     errors: list[str] = []
     config = snapshot / "config.json"
     index = snapshot / "model.safetensors.index.json"
+    monolithic = snapshot / "model.safetensors"
     if not config.is_file() or config.stat().st_size == 0:
         errors.append("missing or empty config.json")
     if not index.is_file() or index.stat().st_size == 0:
-        return errors + ["missing or empty model.safetensors.index.json"]
+        if monolithic.is_file() and monolithic.stat().st_size > 0:
+            return errors
+        return errors + [
+            "missing or empty model.safetensors and model.safetensors.index.json"
+        ]
     try:
         payload = json.loads(index.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
