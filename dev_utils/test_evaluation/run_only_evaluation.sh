@@ -19,6 +19,13 @@ trap cleanup EXIT
 
 source src/commit_utils/set_env_vars.sh
 
+if [ -n "${POST_TRAIN_BENCH_APPTAINER_BIN:-}" ]; then
+    export PATH="$(dirname "$POST_TRAIN_BENCH_APPTAINER_BIN"):${PATH}"
+fi
+if [ -n "${POST_TRAIN_BENCH_APPTAINER_LIBRARY_PATH:-}" ]; then
+    export LD_LIBRARY_PATH="${POST_TRAIN_BENCH_APPTAINER_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
 exec 1>${EVAL_DIR}/z_new_${CLUSTER}_output.log
 exec 2>${EVAL_DIR}/z_new_${CLUSTER}_error.log
 
