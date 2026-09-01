@@ -145,8 +145,12 @@ echo "  Benchmark: $BENCHMARK | Model: $MODEL_HF | Agent: $AGENT ($AGENT_CONFIG)
 echo "  Profile: $JUDGE_PROFILE ($PTB_JUDGE_BACKEND, model=$JUDGE_DEFAULT_MODEL, effort=$JUDGE_DEFAULT_REASONING_EFFORT)"
 echo "  Judges: ${JUDGES[*]} (outputs suffixed with _rerun)"
 
-# Create temporary working directory
-TMP_DIR=$(mktemp -d)
+# Create the potentially large judge sandbox on job-local storage when the
+# scheduler provides it. Several recovery jobs may otherwise fill node /tmp
+# before they reach the shared auth lock.
+JUDGE_SCRATCH_ROOT="${POST_TRAIN_BENCH_SCRATCH_DIR:-${TMPDIR:-/tmp}}"
+mkdir -p "$JUDGE_SCRATCH_ROOT"
+TMP_DIR=$(mktemp -d -p "$JUDGE_SCRATCH_ROOT" judge-recovery.XXXXXX)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 JOB_DIR="$TMP_DIR/job_dir"
