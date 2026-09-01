@@ -244,12 +244,43 @@ with_huggingface_overlay() {
     
     "$@"
     local exit_code=$?
-    
-    fusermount -u "$TMP_SUBDIR/merged_huggingface"
-    rm -r "$TMP_SUBDIR/merged_huggingface"
+
+    # Unmount before removing, and never remove through a mount that is still up.
+    #
+    # A plain `fusermount -u` returns "Device or resource busy" whenever the
+    # wrapped command leaked a process holding the mount -- a vLLM server the
+    # agent started for its own evals is the usual one. The previous code ignored
+    # that failure and went straight to `rm -r merged_huggingface`, i.e. a
+    # recursive delete THROUGH a live overlay whose lowerdir is the shared
+    # HuggingFace cache. fuse-overlayfs turns those deletions into whiteouts in
+    # the upperdir, so $HF_HOME survives, but the walk itself is hours of NFS
+    # traffic. In job 87815 it consumed the entire post-agent budget on three of
+    # eight cells: the agent had already finished with a valid final_model and
+    # "pipeline_completed": true, the 13h wall arrived before run_task.sh ever
+    # reached the final_model copy at the bottom of this script, and all three
+    # cells landed with no final_eval_1.txt and no metrics.json. The tell in
+    # error.log is the pair
+    #     fusermount: failed to unmount .../merged_huggingface: Device or resource busy
+    #     rm: cannot remove '.../merged_huggingface/hub/.locks': Directory not empty
+    # and, on the node, a merged_huggingface line still present in /proc/mounts.
+    local tries
+    for tries in 1 2 3; do
+        mountpoint -q "$TMP_SUBDIR/merged_huggingface" || break
+        fusermount -u "$TMP_SUBDIR/merged_huggingface" 2>/dev/null && break
+        sleep 5
+    done
+    if mountpoint -q "$TMP_SUBDIR/merged_huggingface"; then
+        echo "WARNING: fusermount -u stayed busy, forcing lazy unmount of $TMP_SUBDIR/merged_huggingface" >&2
+        fusermount -u -z "$TMP_SUBDIR/merged_huggingface" 2>/dev/null || true
+    fi
+    if mountpoint -q "$TMP_SUBDIR/merged_huggingface"; then
+        echo "ERROR: $TMP_SUBDIR/merged_huggingface is still mounted; leaving the directory in place rather than deleting through it" >&2
+    else
+        rm -r "$TMP_SUBDIR/merged_huggingface"
+    fi
     rm -r "$TMP_SUBDIR/upper_huggingface"
     rm -r "$TMP_SUBDIR/fuse_workdir"
-    
+
     return $exit_code
 }
 
