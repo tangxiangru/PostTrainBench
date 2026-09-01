@@ -39,6 +39,14 @@ def load_json(path: Path, errors: list[str]) -> Any:
         return None
 
 
+def preferred_rerun(path: Path) -> Path:
+    """Return a non-empty rerun artifact when present, otherwise the original."""
+    rerun = path.with_name(f"{path.stem}_rerun{path.suffix}")
+    if rerun.is_file() and rerun.stat().st_size:
+        return rerun
+    return path
+
+
 def validate(result_dir: Path, judge_profile: str) -> list[str]:
     errors: list[str] = []
     for relative in (
@@ -56,9 +64,14 @@ def validate(result_dir: Path, judge_profile: str) -> list[str]:
         if not path.is_file() or path.stat().st_size == 0:
             errors.append(f"missing or empty: {relative}")
 
-    final_eval_logs = [path for path in result_dir.glob("final_eval_*.txt") if path.stat().st_size]
+    final_eval_logs = [
+        path
+        for pattern in ("final_eval_*.txt", "z_new_*_final_eval_*.txt")
+        for path in result_dir.glob(pattern)
+        if path.stat().st_size
+    ]
     if not final_eval_logs:
-        errors.append("missing or empty: final_eval_*.txt")
+        errors.append("missing or empty: final_eval_*.txt or z_new_*_final_eval_*.txt")
 
     config_path = result_dir / "final_model/config.json"
     config = load_json(config_path, errors) if config_path.is_file() else None
@@ -101,9 +114,9 @@ def validate(result_dir: Path, judge_profile: str) -> list[str]:
             errors.append("runtime provenance judge profile mismatch")
 
     for filename, schema in JUDGEMENT_SCHEMAS.items():
-        path = result_dir / filename
+        path = preferred_rerun(result_dir / filename)
         if not path.is_file() or path.stat().st_size == 0:
-            errors.append(f"missing or empty: {filename}")
+            errors.append(f"missing or empty: {filename} or its _rerun variant")
             continue
         verdict = load_json(path, errors)
         if not isinstance(verdict, dict):

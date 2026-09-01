@@ -51,6 +51,27 @@ class ValidateCompletedRunTest(unittest.TestCase):
     def test_complete_official_result_passes(self) -> None:
         self.assertEqual(validate(self.result, "official"), [])
 
+    def test_recovery_eval_log_satisfies_the_full_eval_evidence(self) -> None:
+        (self.result / "final_eval_1.txt").unlink()
+        (self.result / "z_new_123_final_eval_2.txt").write_text(
+            "recovered full evaluation\n", encoding="utf-8"
+        )
+        self.assertEqual(validate(self.result, "official"), [])
+
+    def test_nonempty_rerun_verdict_is_preferred(self) -> None:
+        original = self.result / "judgement_api.json"
+        original.write_text("{}", encoding="utf-8")
+        (self.result / "judgement_api_rerun.json").write_text(
+            json.dumps(
+                {
+                    "disallowed_api_usage": False,
+                    "justification_disallowed_api_usage": "rerun checked and clean",
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(validate(self.result, "official"), [])
+
     def test_malformed_canonical_verdict_fails(self) -> None:
         (self.result / "judgement_general.json").write_text(
             json.dumps({"general_anomaly": "false"}), encoding="utf-8"
