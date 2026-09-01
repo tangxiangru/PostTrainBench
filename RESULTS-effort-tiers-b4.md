@@ -577,3 +577,84 @@ It can show whether the *lower half* of the board comes up: the prediction is a 
 the decode census above spreads cells of one arm from 0.0485 to 0.4284, so a single-seed
 contrast here sits well inside its own noise. Six cells per arm is the minimum worth
 reading, and the comparison to make is the count above the floor, not the mean.
+
+# The 1 h tier measured nothing, because four of its arms are one script (2026-09-01)
+
+The count-above-the-floor reading above is the right one. Applied to the whole 1 h tier it
+retracts the tier.
+
+Threshold, derived rather than chosen: the pooled 1 h scores (n=65) have their largest gap
+at **0.549 → 0.636**, so "worked" is > 0.5925. The base model is 0.1198. Nothing sits
+between 0.472 and 0.535 either — the distribution is two clumps, a cell produces a working
+fine-tune or it produces something at or under the untrained model.
+
+## Four labels, one payload
+
+`agents/claude_autor_{ctl,pt,fd,fx}/solve.sh` are the **same 2292 bytes**, sha256
+`4c0a7f54a2741afd`. All four mtimes (08-30 07:50, 07:50, 19:03, 10:37) precede every job
+that used them, so the identity held at run time. `agents/` is not tracked in git, so there
+is no commit to diff — the hash has to be taken while the job runs.
+
+| label | worked / cells | Wilson 95% | jobs |
+|---|---|---|---|
+| ctl | 0/12 (0%) | [0.00, 0.24] | 82647, 82648, 82822, 82823 |
+| pt | 2/11 (18%) | [0.05, 0.48] | 82648, 82822, 82823 |
+| fx | 2/8 (25%) | [0.07, 0.59] | 83997, 84425 |
+| fd | 3/4 (75%) | [0.30, 0.95] | 83997 |
+
+**`ctl` vs `fd` is Fisher p = 0.0071 between two byte-identical scripts.** That is this
+design's false-positive rate at these n, measured rather than assumed. Pooled, the one
+configuration is 7/35 = 20%.
+
+## The variable that does separate is the calendar
+
+Within that single script, split by day:
+
+| day | worked / cells | labels present |
+|---|---|---|
+| 08-30 | 2/23 (8.7%) | ctl, pt |
+| 08-31 | 5/12 (41.7%) | fd, fx |
+
+**Fisher p = 0.033.** Same bytes, same task, same model, same agent_config — the success
+rate quadrupled overnight. Whatever moved (CLI build, HF cache contents, upstream `src/`)
+is uncontrolled and is currently the largest effect on this board.
+
+And `ctl` ran **only** on 08-30 while `rc`, `rt`, `dgc`, `dg`, `fxq` ran **only** on 08-31.
+So the headline anyone would write from the arm means — `rc` 6/8 vs `ctl` 0/12, Fisher
+p = 0.00072 — is a comparison between two days, not between two recipes.
+
+## Restricted to same-day, nothing is significant
+
+08-31 only, against the identical-script family's own 5/12 on that same day:
+
+| arm | worked / cells | Wilson 95% | Fisher p |
+|---|---|---|---|
+| rc | 6/8 (75%) | [0.41, 0.93] | 0.197 |
+| rt | 5/8 (63%) | [0.31, 0.86] | 0.650 |
+| rc+rt | 11/16 (69%) | [0.44, 0.86] | 0.250 |
+| dgc | 1/4 (25%) | [0.05, 0.70] | 1.000 |
+| dg | 0/4 (0%) | [0.00, 0.49] | 0.245 |
+| fxq | 0/4 (0%) | [0.00, 0.49] | 0.245 |
+
+**No 1 h arm is demonstrated.** `rc` is the best point estimate and it is not separable
+from a script that is definitionally doing nothing different. Detecting the observed
+75% vs 42% at 80% power needs **≈34 cells per arm** — roughly four full packs each, against
+the one pack each they got.
+
+Two confounds that are clean, checked rather than assumed: success by GPU index is flat
+(1/8 to 3/9 across g0–g7, no g0 advantage, so the `CUDA_VISIBLE_DEVICES` renumbering bug is
+not behind this), and the arms were correctly interleaved across GPUs *within* each pack.
+The design failed one level up — between packs, not inside them.
+
+## What is fixed
+
+`ptb_ops/ptb_pack.sbatch` now refuses, before any cell starts:
+
+- a pack containing two arms whose `solve.sh` are byte-identical
+  (`PTB_ALLOW_DUPLICATE_ARMS=1` overrides, for deliberately measuring the null);
+- a pack with no in-pack control (`PTB_CONTROL_ARM`, default `claude_autor_ctl`;
+  `PTB_NO_CONTROL=1` overrides).
+
+It also echoes `arm_payload <arm> sha=… bytes=… mtime=…` for every arm, so the duplicate is
+visible in the log even when an override is used. Nothing downstream could have caught this:
+`ptb-results/` is keyed on the arm *name*, so a duplicate looks like a real arm forever.

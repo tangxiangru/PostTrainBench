@@ -85,6 +85,56 @@ echo "hf_home=${HF_HOME:-<unset>} hub_cache_overrides=cleared"
 echo "isolate_gpus=${POST_TRAIN_BENCH_ISOLATE_GPUS:-<unset>} eval_gpu_reap=${POST_TRAIN_BENCH_EVAL_GPU_REAP:-<unset>}"
 echo "run_task_sha=$(git rev-parse --short HEAD 2>/dev/null) run_task_inode=$(ls -i src/run_task.sh | awk '{print $1}')"
 
+# Echo, then enforce, the identity of the payloads being compared.
+#
+# The b4 effort-tier batch spent eight a3-node-hours measuring nothing, because
+# claude_autor_{ctl,pt,fd,fx}/solve.sh were all the SAME 2292 bytes (sha256
+# 4c0a7f54...). Four labels, one configuration. Their success rates came out
+# 0/12, 2/11, 2/8 and 3/4, and ctl-vs-fd reads Fisher p=0.0071 -- a p of 0.007
+# between two byte-identical scripts. Nothing downstream could detect this:
+# ptb-results is keyed on the arm NAME, so the duplicate looks like a real arm
+# forever. The only place that can see it is here, before the cells start.
+#
+# agents/ is not tracked in git (tools/ptb_setup.py installs these), so there is
+# no commit to diff against either -- the hash has to be taken at run time.
+declare -A _ARM_SHA=()
+_dupe=""
+for _a in "${ARMS[@]}"; do
+    _f="agents/${_a}/solve.sh"
+    [ -f "$_f" ] || { echo "FATAL: no such arm: ${_f}" >&2; exit 1; }
+    _h="$(sha256sum "$_f" | cut -c1-16)"
+    echo "arm_payload ${_a} sha=${_h} bytes=$(stat -c%s "$_f") mtime=$(date -r "$_f" --iso-8601=seconds)"
+    if [ -n "${_ARM_SHA[$_h]:-}" ] && [ "${_ARM_SHA[$_h]}" != "$_a" ]; then
+        _dupe="${_dupe} ${_ARM_SHA[$_h]}==${_a}"
+    fi
+    _ARM_SHA[$_h]="$_a"
+done
+if [ -n "$_dupe" ]; then
+    echo "FATAL: two arms in this pack have byte-identical solve.sh:${_dupe}" >&2
+    echo "       They cannot be compared -- any difference between them is noise" >&2
+    echo "       wearing two labels. Fix the payload, or drop one arm. Override" >&2
+    echo "       with PTB_ALLOW_DUPLICATE_ARMS=1 only to measure the null." >&2
+    [ "${PTB_ALLOW_DUPLICATE_ARMS:-0}" = "1" ] || exit 1
+    echo "       PTB_ALLOW_DUPLICATE_ARMS=1 -- continuing as a null calibration." >&2
+fi
+
+# A pack is the only unit inside which conditions are held fixed: same node, same
+# hour, same CLI build, same HF cache. In b4 the control ran on 08-30 and every
+# treatment arm on 08-31, and the same script's success rate moved 2/23 -> 5/12
+# (p=0.033) across those two days. So a cross-pack contrast is confounded with
+# the day by construction, and the control has to be IN the pack.
+CONTROL_ARM="${PTB_CONTROL_ARM:-claude_autor_ctl}"
+case " ${ARMS[*]} " in
+    *" ${CONTROL_ARM} "*) echo "control_arm=${CONTROL_ARM} in_pack=yes" ;;
+    *)  echo "FATAL: pack has no control arm (${CONTROL_ARM}); arms=${ARMS[*]}" >&2
+        echo "       Comparing these cells against a control from another job means" >&2
+        echo "       comparing them against another day. Add ${CONTROL_ARM} to the" >&2
+        echo "       pack, set PTB_CONTROL_ARM, or set PTB_NO_CONTROL=1 if this pack" >&2
+        echo "       is deliberately not a comparison." >&2
+        [ "${PTB_NO_CONTROL:-0}" = "1" ] || exit 1
+        echo "       PTB_NO_CONTROL=1 -- continuing without an in-pack control." >&2 ;;
+esac
+
 SCRATCH="${POST_TRAIN_BENCH_TMP_ROOT:-/tmp}"
 mkdir -p "$SCRATCH" || { echo "FATAL: cannot create $SCRATCH on $(hostname)" >&2; exit 1; }
 [ -w "$SCRATCH" ] || { echo "FATAL: $SCRATCH is not writable on $(hostname)" >&2; exit 1; }
