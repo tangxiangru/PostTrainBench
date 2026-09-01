@@ -18,7 +18,12 @@ if [ "$(id -u)" = "0" ]; then
         echo "ERROR: root-owned Slurm allocation requires /usr/sbin/runuser" >&2
         exit 1
     fi
-    exec /usr/sbin/runuser --user "$RUN_AS_USER" -- "$0" "$@"
+    ENTRYPOINT="${POST_TRAIN_BENCH_SLURM_ENTRYPOINT:-}"
+    if [ -z "$ENTRYPOINT" ] || [ ! -r "$ENTRYPOINT" ]; then
+        echo "ERROR: root-owned Slurm allocation requires a readable repository entrypoint" >&2
+        exit 1
+    fi
+    exec /usr/sbin/runuser --user "$RUN_AS_USER" -- /bin/bash "$ENTRYPOINT" "$@"
 fi
 
 if [ "$#" -ne 7 ]; then

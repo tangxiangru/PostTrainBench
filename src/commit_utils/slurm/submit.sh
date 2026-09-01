@@ -95,6 +95,7 @@ if [ -z "$CURRENT_BRANCH" ] || [ "$CURRENT_BRANCH" != "$RUN_BRANCH" ]; then
 fi
 export POST_TRAIN_BENCH_RUN_BRANCH="$RUN_BRANCH"
 export POST_TRAIN_BENCH_SLURM_JOB_NAME="$JOB_NAME_SAFE"
+export POST_TRAIN_BENCH_SLURM_ENTRYPOINT="$SCRIPT_DIR/single_task.sbatch"
 
 for value_name in EVALUATION_TASK AGENT MODEL_TO_TRAIN NUM_HOURS AGENT_CONFIG; do
     if [ -z "${!value_name}" ]; then
