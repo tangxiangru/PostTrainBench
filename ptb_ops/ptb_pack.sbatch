@@ -1,12 +1,21 @@
 #!/bin/bash
 #SBATCH --job-name=ptb-pack
 #SBATCH --partition=a3
-# 11 of a3's 14 nodes are held by reservation robtang-a3, the other 3 by froilanchoi's
-# UNLIMITED jobs, so a pack submitted without the reservation never starts -- it waits on
-# three nodes that never free and squeue calls it (Resources). Not settable from the
-# environment: SBATCH_RESERVATION applies to every partition, and an airs/eval job that
-# inherits it dies at submit with "allocation failure".
+# 11 of a3's 14 nodes are held by reservation robtang-a3, the other 3 -- a3nodeset0-[0-2]
+# -- are froilanchoi's. A pack submitted without the reservation usually never starts: it
+# waits on those three and squeue calls it (Resources). Not settable from the environment:
+# SBATCH_RESERVATION applies to every partition, and an airs/eval job that inherits it
+# dies at submit with "allocation failure".
 #SBATCH --reservation=robtang-a3
+# (Resources) is the *lucky* outcome. 89727/89809/89810 were submitted with an empty
+# `--reservation=` on the command line -- which silently voids the line above -- at
+# 23:13 on 2026-09-01, three hours after froilanchoi's last autolab job released
+# a3nodeset0-[0-2]. The scheduler did the only thing left: it put three exclusive
+# eight-GPU packs on all three of someone else's nodes for sixteen hours. They ran 3.5h
+# before being requeued off. So the reservation is not the only guard -- name the nodes:
+#SBATCH --exclude=slurm2-a3nodeset0-[0-2]
+# A command-line --exclude REPLACES this line rather than adding to it, so any pack
+# submitted with its own --exclude must carry slurm2-a3nodeset0-[0-2] in it.
 #SBATCH --nodes=1
 #SBATCH --exclusive
 #SBATCH --gres=gpu:8

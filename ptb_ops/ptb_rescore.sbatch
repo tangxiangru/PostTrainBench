@@ -5,6 +5,10 @@
 # unschedulable rather than merely queued. See ptb_pack.sbatch for why it cannot be an
 # environment variable.
 #SBATCH --reservation=robtang-a3
+#SBATCH --exclude=slurm2-a3nodeset0-[0-2]
+# a3nodeset0-[0-2] are froilanchoi's. An empty `--reservation=` on the command line
+# voids the line above and lands the job there -- see ptb_pack.sbatch, 89727/89809/89810.
+# A command-line --exclude REPLACES this line, so it must carry these nodes too.
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
