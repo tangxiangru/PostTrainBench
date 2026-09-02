@@ -822,3 +822,90 @@ AutoR's ten-hour arms were already greedy, so they do not move; `claude_vertex` 
 Equalising moved the pair from a dead tie (−0.0070, t −0.37, vertex 6/8) to a
 1.9-point lead for `claude_vertex` that still does not clear. Report it as unresolved
 with the point estimate against AutoR, not as a tie.
+
+# The ten-hour tier gets a clean design and returns a null: `sn` vs `r2` (2026-09-02)
+
+Jobs **89727**, **89809**, **89810**, all COMPLETED, ~10.2 h each, 24 cells, `pack_exit=0`
+on all three and `rc=0` on all twenty-four. This is the first PTB contrast on this cluster
+where every nuisance the sections above identified is off by construction rather than
+argued away afterwards.
+
+## The design
+
+| | |
+| --- | --- |
+| arms | `claude_autor_sn` (`f99b4db`) vs `claude_autor_r2` (`12c2d46`) |
+| layout | 3 packs x 8 GPUs, arms interleaved even/odd, **4 + 4 in every pack** |
+| task / model | gsm8k, `Qwen/Qwen3-1.7B-Base`, agent Claude Opus 5, 10 h |
+| in-pack control | `claude_autor_r2`, enforced by `ptb_pack.sbatch` |
+
+Both arms appear in all three packs, so the pack is a block to subtract and not a
+confound. That is the fix the b4 post-mortem above prescribed and could not apply
+retroactively.
+
+## What the treatment is
+
+`r2` is `sn` plus **two prose sections appended to `AUTOR_STAGE_NOTE`** in
+`src/posttrainbench.py`, and nothing else. Diffing the two payload trees outside `.git/`
+and `__pycache__/` returns exactly two files: that one, and `docs/iclr.md`. The two
+sections are:
+
+- *The rules you are under, and the rules you inferred* — a restriction you derived from
+  a prohibition costs the same as breaking one; find the file that states what is
+  permitted and quote the clause before dropping a resource.
+- *Two stages of optimisation, and more than one finishable candidate* — reserve the
+  second half of the clock for a second optimisation stage and let that reservation
+  constrain the first half; the cheapest extra candidate is a weight average of
+  checkpoints you already hold; report how many candidates you finished next to the
+  score you shipped.
+
+Both were written against defects the 27-cell board showed. `docs/iclr.md` differs by 82
+lines and nothing on the PTB entry path reads it, but it is in the checkout and so is
+named here rather than left for someone to rediscover.
+
+## Neither nuisance that ruined the one-hour board is present
+
+- **Decode.** All 24 cells shipped `temperature: 0.0`. The pack log records it per cell
+  (`cell_decode`), so this is read off the run and not inferred from `final_model/`.
+  The flag that carried 91% of the between-arm variance at 1 h is constant here.
+- **Reliability.** All 24 produced a `final_model/` above the greedy untrained base
+  (0.3328) — the closest cell is more than twice it. The "did the run ship trained
+  weights" bit, which was the other half of the 1 h board's entire spread, is saturated.
+
+So the outcome variable is measuring the treatment. That was not true of any earlier
+contrast in this file.
+
+## The result is a null, on all three readings
+
+| reading | n | `sn` | `r2` | `sn` - `r2` | |
+| --- | ---: | ---: | ---: | ---: | --- |
+| cells, Welch | 12 / 12 | 78.97 | 77.82 | **+1.15** (SE 1.73) | p = 0.52, 95% CI [-2.25, +4.55] |
+| pack as the unit | 3 / 3 | | | **+1.15** (SE 1.90) | t_2 CI [-7.05, +9.35] |
+| blocked exact permutation | 343,000 arrangements | | | +1.15 | **p = 0.514** |
+
+Per pack, `sn` - `r2` is **-1.54, +0.15, +4.83**. The sign is not stable across three
+packs of the same contrast, which is the same message the interval gives.
+
+Direction matters for what to do next: `r2` is the arm *with* the two sections, so the
+point estimate on adding them is **-1.15 pt**, and the honest summary is that they buy
+nothing and may cost a little.
+
+## What this can and cannot rule out
+
+Pooled sd is 4.25 pt, so 12 v 12 has 80% power against about **4.9 pt**. The contrast
+therefore excludes an effect the size of anything else on this board and says nothing
+about a one- or two-point one: detecting the observed +1.15 would need roughly **215
+cells per arm**, which at 10 h and one GPU per cell is not a measurement anyone is going
+to make here.
+
+The two arms are also not equally noisy — `sn` sd 2.84, `r2` sd 5.30, and `r2` owns the
+three lowest cells on the board (0.6854, 0.7127, 0.7157). Welch is used above for that
+reason; pricing the interval at the control's spread would have understated it.
+
+## Cells not in the contrast
+
+`claude_autor_sn` carries 8 further scored cells from 84998/84999 and `claude_autor_r2`
+carries 18 from 86725-87815. Pooling all of them gives +1.49 +/- 1.13 (Welch p = 0.19) —
+the same null — but those cells come from different builds on different days, which is
+the drift the b4 sections above show inverting a whole ranking. The 12 v 12 in-pack
+number is the one to quote.
