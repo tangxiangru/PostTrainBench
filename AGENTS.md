@@ -151,6 +151,12 @@ The `evaluate.py` must:
 
 ## Running Jobs
 
+For `_awm` scientist profiles, the public checkout mounted into the scientist
+must never contain `skills/wma`, `skills/wma_meta`, `awm/wma`, WMA history, or
+WMA transcripts. Online WMA review runs in the private sidecar started by
+`run_task.sh`; only the thin request client and resulting verdicts are
+scientist-visible.
+
 ```bash
 # Submit the full agent × benchmark × model sweep (edit the loop / EXPERIMENT_NAME at the top)
 bash src/commit_utils/commit.sh

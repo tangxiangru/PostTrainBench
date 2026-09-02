@@ -94,4 +94,15 @@ if bash "$SCRIPT_DIR/submit.sh" \
     exit 1
 fi
 
+# The WMA policy checkout and history are mounted only into a separate sidecar
+# container. The scientist profile must not receive their host paths.
+grep -F -- '--bind "${WMA_CHECKOUT}:/opt/awm:ro"' "$REPO_ROOT/src/run_task.sh" >/dev/null
+grep -F -- '--bind "${WMA_HISTORY}:/history:ro"' "$REPO_ROOT/src/run_task.sh" >/dev/null
+grep -F -- '--bind "${JOB_DIR}/task:/session:ro"' "$REPO_ROOT/src/run_task.sh" >/dev/null
+grep -F -- 'python3 -m awm.wma.sidecar' "$REPO_ROOT/src/run_task.sh" >/dev/null
+if grep -q 'POST_TRAIN_BENCH_WMA_' "$REPO_ROOT/agents/claude_vertex_high_awm/env_passthrough.txt"; then
+    echo "private WMA sidecar settings leaked into the scientist environment" >&2
+    exit 1
+fi
+
 echo "Slurm adapter tests passed."

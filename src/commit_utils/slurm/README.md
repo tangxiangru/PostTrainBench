@@ -171,3 +171,19 @@ reaches the sandbox environment, and a missing source is an error before the
 agent starts. Unset or empty, the default, changes nothing. A study uses it to
 mount its own read-only code or data next to the task; `agents/claude_vertex_max_awm`
 expects a checkout of `agentic-world-model` at `/home/ben/awm` this way.
+
+## Private online WMA sidecar
+
+For a WMA-aware `claude_vertex_high_awm` cell, the launcher provides a second
+checkout through `POST_TRAIN_BENCH_WMA_SIDECAR_CHECKOUT` plus a read-only
+history path. `run_task.sh` mounts those only into a separate CPU-only
+Apptainer process. The scientist container receives the public checkout and
+thin `awm wma` request client, but never the private `awm/wma`, `skills/wma`,
+history, or WMA transcript.
+
+The sidecar watches `<task>/.wma/requests`, accepts only locked experiment
+cards, runs reviews asynchronously, writes `exp-NN.verdict.json`, and records
+request status under `<task>/.wma`. Full Claude transcripts are written under
+the result directory's `wma_private/`, outside the scientist container. The
+sidecar mounts the scientist session read-only except for `.wma` and
+`memory/cards`, and uses an isolated home and empty Claude setting sources.

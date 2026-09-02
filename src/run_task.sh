@@ -279,7 +279,86 @@ with_record_the_time() {
 
 SOLVE_OUT="${EVAL_DIR}/solve_out.txt"
 
+start_wma_sidecar() {
+    WMA_SIDECAR_PID=""
+    WMA_CHECKOUT="${POST_TRAIN_BENCH_WMA_SIDECAR_CHECKOUT:-}"
+    if [ -z "$WMA_CHECKOUT" ]; then
+        return 0
+    fi
+    WMA_HISTORY="${POST_TRAIN_BENCH_WMA_HISTORY:-}"
+    if [ ! -r "$WMA_CHECKOUT/awm/wma/sidecar.py" ] || [ ! -r "$WMA_CHECKOUT/skills/wma/SKILL.md" ]; then
+        echo "ERROR: private WMA sidecar checkout is incomplete: $WMA_CHECKOUT" >&2
+        return 1
+    fi
+    if [ ! -d "$WMA_HISTORY" ]; then
+        echo "ERROR: private WMA history directory is missing: $WMA_HISTORY" >&2
+        return 1
+    fi
+    mkdir -p "${JOB_DIR}/task/memory/cards" "${JOB_DIR}/task/.wma" \
+        "${JOB_TMP}/wma-home" "${JOB_TMP}/wma-tmp" "${EVAL_DIR}/wma_private"
+    rm -f "${JOB_DIR}/task/.wma/stop"
+    WMA_IMAGE="${POST_TRAIN_BENCH_CONTAINERS_DIR}/${POST_TRAIN_BENCH_CONTAINER_NAME}.sif"
+    echo "Starting private WMA sidecar: model=${POST_TRAIN_BENCH_WMA_MODEL} effort=${POST_TRAIN_BENCH_WMA_EFFORT}"
+    apptainer exec \
+        --containall \
+        --cleanenv \
+        --env PATH="/root/.local/bin:/home/ben/.local/bin:$PATH" \
+        --env PYTHONPATH="/opt/awm" \
+        --env PYTHONNOUSERSITE="1" \
+        --env CLAUDE_CODE_USE_VERTEX="${CLAUDE_CODE_USE_VERTEX:-1}" \
+        --env ANTHROPIC_VERTEX="true" \
+        --env ANTHROPIC_VERTEX_PROJECT_ID="${ANTHROPIC_VERTEX_PROJECT_ID}" \
+        --env ANTHROPIC_VERTEX_REGION="${ANTHROPIC_VERTEX_REGION}" \
+        --env GOOGLE_CLOUD_PROJECT="${ANTHROPIC_VERTEX_PROJECT_ID}" \
+        --env GOOGLE_CLOUD_LOCATION="${ANTHROPIC_VERTEX_REGION}" \
+        --env ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-opus-5}" \
+        --env ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-claude-opus-5}" \
+        --env VERTEX_REGION_CLAUDE_5_OPUS="${VERTEX_REGION_CLAUDE_5_OPUS:-${ANTHROPIC_VERTEX_REGION}}" \
+        --bind "${WMA_CHECKOUT}:/opt/awm:ro" \
+        --bind "${WMA_HISTORY}:/history:ro" \
+        --bind "${JOB_DIR}/task:/session:ro" \
+        --bind "${JOB_DIR}/task/memory/cards:/session/memory/cards" \
+        --bind "${JOB_DIR}/task/.wma:/session/.wma" \
+        --bind "${JOB_TMP}/wma-tmp:/tmp" \
+        --bind "${EVAL_DIR}/wma_private:/wma-private" \
+        --home "${JOB_TMP}/wma-home:/home/ben" \
+        --pwd "/session" \
+        --writable-tmpfs \
+        "$WMA_IMAGE" \
+        python3 -m awm.wma.sidecar \
+            --session /session \
+            --skill-dir /opt/awm/skills/wma \
+            --history /history \
+            --backend "${POST_TRAIN_BENCH_WMA_BACKEND:-claude}" \
+            --model "${POST_TRAIN_BENCH_WMA_MODEL:-claude-opus-5[1m]}" \
+            --effort "${POST_TRAIN_BENCH_WMA_EFFORT:-high}" \
+            --budget "${POST_TRAIN_BENCH_WMA_BUDGET:-cpu=10,gpu=0,wall=15,turns=40}" \
+            --jobs "${POST_TRAIN_BENCH_WMA_JOBS:-4}" \
+            --private-output /wma-private \
+            --scratch-dir /tmp \
+            > "${EVAL_DIR}/wma_sidecar.log" 2>&1 &
+    WMA_SIDECAR_PID=$!
+    echo "Private WMA sidecar pid=${WMA_SIDECAR_PID}"
+}
+
+stop_wma_sidecar() {
+    if [ -z "${WMA_SIDECAR_PID:-}" ]; then
+        return 0
+    fi
+    touch "${JOB_DIR}/task/.wma/stop"
+    if wait "$WMA_SIDECAR_PID"; then
+        printf '{"state":"completed","pid":%s}\n' "$WMA_SIDECAR_PID" \
+            > "${JOB_DIR}/task/.wma/sidecar_status.json"
+    else
+        status=$?
+        printf '{"state":"failed","pid":%s,"exit_code":%s}\n' "$WMA_SIDECAR_PID" "$status" \
+            > "${JOB_DIR}/task/.wma/sidecar_status.json"
+        echo "WARNING: private WMA sidecar exited with status $status" >&2
+    fi
+}
+
 solve_task() {
+    start_wma_sidecar || return 1
     AGENT_AUTH_BIND=()
     [ -n "$AGENT_AUTH_SRC" ] && AGENT_AUTH_BIND=(--bind "${AGENT_AUTH_SRC}:/home/ben/.codex/auth.json")
     CURSOR_AUTH_BIND=()
@@ -324,7 +403,7 @@ solve_task() {
         echo "Extra sandbox binds: ${POST_TRAIN_BENCH_EXTRA_BINDS}"
     fi
     # --- extra binds (end) ---
-    timeout --signal=TERM --kill-after=30s "$((NUM_HOURS * 60 + 5))m" \
+    if timeout --signal=TERM --kill-after=30s "$((NUM_HOURS * 60 + 5))m" \
     apptainer exec \
         --nv \
         "${NVCCLI_ARGS[@]}" \
@@ -356,7 +435,13 @@ solve_task() {
         --pwd "/home/ben/task" \
         --writable-tmpfs \
         "${POST_TRAIN_BENCH_CONTAINERS_DIR}/${POST_TRAIN_BENCH_CONTAINER_NAME}.sif" \
-        bash -c "set -o pipefail; { python /home/ben/check_cuda.py && python /home/ben/check_cuda_writing.py || exit 1; bash /home/ben/system_monitor.sh & MONITOR_PID=\$!; bash /home/ben/agent_solve.sh; AGENT_EXIT=\$?; kill \$MONITOR_PID 2>/dev/null || true; exit \$AGENT_EXIT; } 2>&1 | python /home/ben/timestamp_lines.py" > "${SOLVE_OUT}" 2>&1
+        bash -c "set -o pipefail; { python /home/ben/check_cuda.py && python /home/ben/check_cuda_writing.py || exit 1; bash /home/ben/system_monitor.sh & MONITOR_PID=\$!; bash /home/ben/agent_solve.sh; AGENT_EXIT=\$?; kill \$MONITOR_PID 2>/dev/null || true; exit \$AGENT_EXIT; } 2>&1 | python /home/ben/timestamp_lines.py" > "${SOLVE_OUT}" 2>&1; then
+        AGENT_STATUS=0
+    else
+        AGENT_STATUS=$?
+    fi
+    stop_wma_sidecar
+    return "$AGENT_STATUS"
 }
 
 # ---------- judge auth/profile precheck ----------

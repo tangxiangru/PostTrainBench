@@ -209,6 +209,16 @@ def init(args: argparse.Namespace) -> None:
             ),
         },
         "judge_profile": os.environ.get("POST_TRAIN_BENCH_JUDGE_PROFILE", "official"),
+        "wma_runtime": {
+            "enabled": bool(os.environ.get("POST_TRAIN_BENCH_WMA_SIDECAR_CHECKOUT")),
+            "checkout_sha": os.environ.get("POST_TRAIN_BENCH_WMA_CHECKOUT_SHA"),
+            "checkout_digest": os.environ.get("POST_TRAIN_BENCH_WMA_CHECKOUT_DIGEST"),
+            "backend": os.environ.get("POST_TRAIN_BENCH_WMA_BACKEND"),
+            "model": os.environ.get("POST_TRAIN_BENCH_WMA_MODEL"),
+            "effort": os.environ.get("POST_TRAIN_BENCH_WMA_EFFORT"),
+            "mode": os.environ.get("POST_TRAIN_BENCH_WMA_MODE"),
+            "budget": os.environ.get("POST_TRAIN_BENCH_WMA_BUDGET"),
+        },
     }
     Path(args.output).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
