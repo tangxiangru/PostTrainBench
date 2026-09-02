@@ -294,7 +294,10 @@ start_wma_sidecar() {
         echo "ERROR: private WMA history directory is missing: $WMA_HISTORY" >&2
         return 1
     fi
-    mkdir -p "${JOB_DIR}/task/memory/cards" "${JOB_DIR}/task/.wma" \
+    # Publish the attachment point synchronously before the scientist can start.
+    # The thin client treats a missing requests directory as the no-WMA control,
+    # so leaving creation to the background worker creates a startup race.
+    mkdir -p "${JOB_DIR}/task/memory/cards" "${JOB_DIR}/task/.wma/requests" \
         "${JOB_TMP}/wma-home" "${JOB_TMP}/wma-tmp" "${EVAL_DIR}/wma_private"
     rm -f "${JOB_DIR}/task/.wma/stop"
     WMA_IMAGE="${POST_TRAIN_BENCH_CONTAINERS_DIR}/${POST_TRAIN_BENCH_CONTAINER_NAME}.sif"
