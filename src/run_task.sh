@@ -299,6 +299,131 @@ with_record_the_time() {
     return $exit_code
 }
 
+# ---------- final_model snapshot daemon ----------
+# Everything the agent produces lives on node-local scratch until the copy at
+# the bottom of this script. Anything that ends the cell before that line is
+# reached therefore destroys a finished model: the wall clock, a node fault, or
+# -- the case that motivated this -- a requeue. On 2026-09-02T02:53:10 jobs
+# 89727/89809/89810 were requeued out from under 24 cells that had each already
+# written a valid 3.3 GB final_model, 3.5 h in. Not preemption (PreemptMode=OFF
+# cluster-wide) and not a node fault (BootTime unchanged since 2026-08-12): a
+# peer on the shared POSIX account set ExcNodeList to the three nodes we held
+# and requeued us off them. Slurm restarts a requeued job from argv, so all 24
+# cells began again from zero and every model died with the scratch dir.
+#
+# So: mirror the current final_model to shared storage while the agent runs. A
+# cell that dies before scoring then still leaves a scoreable artefact instead
+# of nothing. Deliberately cheap and deliberately timid:
+#   - copies only when the directory's (name, size, mtime) set actually changed,
+#     so an agent that trains once and then evaluates for six hours pays once;
+#   - refuses to run when shared storage is tight -- /rmeng_data sat at 94% the
+#     day this was written, and insurance that fills the filesystem is not
+#     insurance;
+#   - swaps the new snapshot in with two renames, so there is no instant where
+#     the previous good snapshot is gone and the new one is not yet there;
+#   - never fails the run. Every error is a line in the log and nothing else.
+# The snapshot is deleted once the real copy below succeeds, so in the ordinary
+# case this costs zero steady-state disk.
+#
+# `ls a b` exits nonzero when EITHER operand is missing, so the obvious
+# one-liner `ls "$d"/*.safetensors "$d"/*.bin` is false for every real
+# checkpoint (they ship .safetensors and no .bin). Written that way the daemon
+# logged nothing, copied nothing, and looked perfectly healthy -- caught only
+# because tests/test_final_model_snapshot.sh drives it against fake weights.
+has_model_weights() {
+    local d="$1"
+    [ -d "$d" ] || return 1
+    ls "$d"/*.safetensors >/dev/null 2>&1 && return 0
+    ls "$d"/*.bin        >/dev/null 2>&1 && return 0
+    return 1
+}
+
+snapshot_final_model_daemon() {
+    local src="$1" dst_root="$2"
+    local interval="${POST_TRAIN_BENCH_SNAPSHOT_INTERVAL:-2700}"
+    local min_free_gib="${POST_TRAIN_BENCH_SNAPSHOT_MIN_FREE_GIB:-200}"
+    local log="$dst_root/final_model_snapshot.log"
+    local live="$dst_root/final_model_snapshot"
+    local incoming="$dst_root/.final_model_snapshot.incoming"
+    local stale="$dst_root/.final_model_snapshot.stale"
+    local last_sig="" sig avail
+
+    mkdir -p "$dst_root" 2>/dev/null
+
+    while true; do
+        sleep "$interval"
+
+        # Nothing worth copying yet. An empty or weights-free directory is the
+        # normal state for the first hour or two of a run.
+        has_model_weights "$src" || continue
+
+        sig=$(find "$src" -maxdepth 1 -type f -printf '%f %s %T@\n' 2>/dev/null \
+              | sort | md5sum | cut -d' ' -f1)
+        [ -n "$sig" ] || continue
+        [ "$sig" = "$last_sig" ] && continue
+
+        avail=$(df -BG --output=avail "$dst_root" 2>/dev/null | tail -1 | tr -dc '0-9')
+        if [ -n "$avail" ] && [ "$avail" -lt "$min_free_gib" ]; then
+            echo "$(date -u +%FT%TZ) skip: only ${avail}GiB free on the results filesystem (floor ${min_free_gib}GiB)" >> "$log"
+            continue
+        fi
+
+        rm -rf "$incoming" 2>/dev/null
+        if ! cp -r "$src" "$incoming" 2>>"$log"; then
+            echo "$(date -u +%FT%TZ) FAILED: cp -r $src -> $incoming" >> "$log"
+            rm -rf "$incoming" 2>/dev/null
+            continue
+        fi
+        cat > "$incoming/SNAPSHOT_MANIFEST.json" <<MANIFEST
+{
+  "note": "Mid-run mirror of final_model taken by run_task.sh, NOT a scored result.",
+  "taken_at": "$(date -u +%FT%TZ)",
+  "source": "$src",
+  "eval_dir": "$dst_root",
+  "slurm_job_id": "${SLURM_JOB_ID:-}",
+  "container_uuid": "${RANDOM_UUID:-}",
+  "agent": "${AGENT:-}",
+  "signature": "$sig"
+}
+MANIFEST
+
+        # Two renames rather than delete-then-move: a kill between them leaves
+        # the snapshot under .stale, recoverable, instead of leaving nothing.
+        if [ -d "$live" ]; then mv "$live" "$stale" 2>/dev/null; fi
+        if mv "$incoming" "$live" 2>>"$log"; then
+            last_sig="$sig"
+            echo "$(date -u +%FT%TZ) ok: snapshot updated ($(du -sh "$live" 2>/dev/null | cut -f1)) sig=$sig" >> "$log"
+        else
+            echo "$(date -u +%FT%TZ) FAILED: mv $incoming -> $live" >> "$log"
+            [ -d "$stale" ] && mv "$stale" "$live" 2>/dev/null
+        fi
+        rm -rf "$stale" 2>/dev/null
+    done
+}
+
+SNAPSHOT_PID=""
+start_final_model_snapshots() {
+    local interval="${POST_TRAIN_BENCH_SNAPSHOT_INTERVAL:-2700}"
+    if [ "$interval" = "0" ]; then
+        echo "final_model snapshots: disabled (POST_TRAIN_BENCH_SNAPSHOT_INTERVAL=0)"
+        return 0
+    fi
+    snapshot_final_model_daemon "${JOB_DIR}/task/final_model" "${EVAL_DIR}" &
+    SNAPSHOT_PID=$!
+    echo "final_model snapshots: every ${interval}s from ${JOB_DIR}/task/final_model -> ${EVAL_DIR}/final_model_snapshot (pid ${SNAPSHOT_PID})"
+}
+
+stop_final_model_snapshots() {
+    [ -n "$SNAPSHOT_PID" ] || return 0
+    kill "$SNAPSHOT_PID" 2>/dev/null
+    wait "$SNAPSHOT_PID" 2>/dev/null
+    SNAPSHOT_PID=""
+    # A copy interrupted by the kill is a partial tree that must never be
+    # mistaken for a snapshot; the live one is already atomically in place.
+    rm -rf "${EVAL_DIR}/.final_model_snapshot.incoming" 2>/dev/null
+}
+trap stop_final_model_snapshots EXIT
+
 SOLVE_OUT="${EVAL_DIR}/solve_out.txt"
 
 solve_task() {
@@ -460,8 +585,10 @@ echo "================================"
 echo "========= RUNNING TASK ========="
 echo "================================"
 
+start_final_model_snapshots
 with_huggingface_overlay with_record_the_time solve_task
 SOLVE_EXIT=$?
+stop_final_model_snapshots
 
 echo "--- SOLVE DIAGNOSTICS ---"
 echo "exit_code: $SOLVE_EXIT"
@@ -521,6 +648,22 @@ echo "================================"
 
 if [ -d "${JOB_DIR}/task/final_model" ]; then
     cp -r "${JOB_DIR}/task/final_model" "$EVAL_DIR/final_model"
+fi
+
+# The mid-run mirror exists only to survive a cell that never reaches the copy
+# above. Reaching it makes the mirror redundant, and keeping both would double
+# every cell's footprint on the results filesystem, which is the scarce
+# resource here. Drop it only once the real copy is verifiably in place -- if
+# that cp failed or produced nothing, the snapshot is the best artefact this
+# cell has and must stay.
+if has_model_weights "$EVAL_DIR/final_model"; then
+    if [ -d "$EVAL_DIR/final_model_snapshot" ]; then
+        echo "final_model copied; discarding the mid-run snapshot at $EVAL_DIR/final_model_snapshot"
+        rm -rf "$EVAL_DIR/final_model_snapshot"
+    fi
+    rm -rf "$EVAL_DIR/.final_model_snapshot.stale" 2>/dev/null
+elif [ -d "$EVAL_DIR/final_model_snapshot" ]; then
+    echo "WARNING: no usable $EVAL_DIR/final_model; KEEPING the mid-run snapshot at $EVAL_DIR/final_model_snapshot" >&2
 fi
 
 if [ -f "${JOB_DIR}/task/system_monitor.log" ]; then
