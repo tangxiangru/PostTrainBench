@@ -330,7 +330,7 @@ start_wma_sidecar() {
             --skill-dir /opt/awm/skills/wma \
             --history /history \
             --backend "${POST_TRAIN_BENCH_WMA_BACKEND:-claude}" \
-            --model "${POST_TRAIN_BENCH_WMA_MODEL:-claude-opus-5[1m]}" \
+            --model "${POST_TRAIN_BENCH_WMA_MODEL:-claude-opus-5}" \
             --effort "${POST_TRAIN_BENCH_WMA_EFFORT:-high}" \
             --budget "${POST_TRAIN_BENCH_WMA_BUDGET:-cpu=10,gpu=0,wall=15,turns=40}" \
             --jobs "${POST_TRAIN_BENCH_WMA_JOBS:-4}" \
