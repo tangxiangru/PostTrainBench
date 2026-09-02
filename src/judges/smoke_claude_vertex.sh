@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Make one real, minimal Claude Code request through the same isolated Vertex
-# path used by the PTB Claude judge profile. Intended for Slurm node preflight;
+# path used by the PTB official Claude judge profile. Intended for Slurm node preflight;
 # it writes no benchmark result and prints no credential material.
 
 set -euo pipefail
@@ -35,13 +35,13 @@ JOB_TMP="$SMOKE_ROOT/tmp"
 OUT_DIR="$SMOKE_ROOT/out"
 mkdir -p "$JOB_DIR/task" "$JOB_TMP" "$OUT_DIR"
 
-export POST_TRAIN_BENCH_JUDGE_PROFILE="claude"
+export POST_TRAIN_BENCH_JUDGE_PROFILE="official"
 export POST_TRAIN_BENCH_JUDGE_AUTH_MODE="vertex"
 export POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL="${POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL:-claude-opus-5[1m]}"
 export POST_TRAIN_BENCH_CLAUDE_JUDGE_CONTAINER="${POST_TRAIN_BENCH_CLAUDE_JUDGE_CONTAINER:-opus_5.sif}"
 
 source src/judges/judge_lib.sh
-configure_judge_profile claude
+configure_judge_profile official
 load_judge_conf data_contamination_judge
 setup_judge_auth "$JOB_DIR"
 JUDGE_EXTRA_APPTAINER_ARGS=()
@@ -72,7 +72,7 @@ assert init is not None, "Claude init event missing"
 assert result is not None and result.get("subtype") == "success" and not result.get("is_error"), result
 assert result.get("result") == marker, result
 assert metadata.get("auth_mode") == "vertex", metadata
-assert metadata.get("reasoning_effort") == "xhigh", metadata
+assert metadata.get("reasoning_effort") == "high", metadata
 assert metadata.get("resolved_model") == init.get("model"), (metadata, init)
 assert "opus-5" in init.get("model", ""), init
 model_usage = result.get("modelUsage") or {}

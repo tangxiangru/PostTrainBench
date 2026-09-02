@@ -33,45 +33,55 @@ assert_eq() {
     [ "$1" = "$2" ] || fail "expected '$2', got '$1'"
 }
 
-# No selection must retain the official/canonical behavior.
+# No selection must use Claude Opus 5 high and retain canonical output ids.
 unset POST_TRAIN_BENCH_JUDGE_PROFILE
-configure_judge_profile
-export POST_TRAIN_BENCH_JUDGE_AUTH_MODE="chatgpt"
-resolve_judge_auth_mode
-load_judge_conf data_contamination_judge
-assert_eq "$JUDGE_PROFILE" "official"
-assert_eq "$PTB_JUDGE_BACKEND" "codex"
-assert_eq "$JUDGE_MODEL" "gpt-5.4"
-assert_eq "$JUDGE_OUTPUT_ID" "gpt5_4"
-OFFICIAL_PROMPT="$(build_judge_prompt data_contamination_judge gsm8k google/gemma-3-4b-pt claude opus)"
-load_judge_conf general_judge
-assert_eq "$JUDGE_MODEL" "gpt-5.6-terra"
-assert_eq "$JUDGE_CODEX_VERSION" "0.144.5"
-assert_eq "$JUDGE_OUTPUT_ID" "general"
-load_judge_conf data_contamination_judge
-
-mkdir -p "$TMP_ROOT/official/job/.codex"
-touch "$TMP_ROOT/official/codex-auth.json" "$TMP_ROOT/official/job/.codex/auth.json"
-JUDGE_CODEX_AUTH_SRC="$TMP_ROOT/official/codex-auth.json"
-run_judge_exec "$TMP_ROOT/official/job" "$TMP_ROOT/official/tmp" \
-    "$TMP_ROOT/official/out/judge_output_gpt5_4_rerun.json" "OFFICIAL_PROMPT_SENTINEL"
-collect_judge_output "$TMP_ROOT/official/job" "$TMP_ROOT/official/out" "_rerun" 1
-[ -f "$TMP_ROOT/official/out/judgement_gpt5_4_rerun.json" ] || fail "official judgement missing"
-grep -q 'MOCK_CODEX_COMMAND' "$MOCK_APPTAINER_LOG" || fail "official profile did not invoke codex"
-
-# Claude selection changes backend and names, not the judge task/prompt.
-export POST_TRAIN_BENCH_JUDGE_PROFILE="claude"
-export POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL="opus"
+export POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL="claude-opus-5[1m]"
 export POST_TRAIN_BENCH_JUDGE_AUTH_MODE="claude_oauth"
 printf '%s\n' 'judge-only-mock-token' > "$TMP_ROOT/claude-oauth-token"
 chmod 600 "$TMP_ROOT/claude-oauth-token"
 export POST_TRAIN_BENCH_CLAUDE_JUDGE_OAUTH_TOKEN_FILE="$TMP_ROOT/claude-oauth-token"
 configure_judge_profile
+resolve_judge_auth_mode
+load_judge_conf data_contamination_judge
+assert_eq "$JUDGE_PROFILE" "official"
+assert_eq "$PTB_JUDGE_BACKEND" "claude"
+assert_eq "$JUDGE_MODEL" "claude-opus-5[1m]"
+assert_eq "$JUDGE_REASONING_EFFORT" "high"
+assert_eq "$JUDGE_OUTPUT_ID" "gpt5_4"
+OFFICIAL_PROMPT="$(build_judge_prompt data_contamination_judge gsm8k google/gemma-3-4b-pt claude opus)"
+declare -A EXPECTED_OFFICIAL_IDS=(
+    [data_contamination_judge]="gpt5_4"
+    [api_usage_judge]="api"
+    [ptb_lookup_judge]="ptb_lookup"
+    [general_judge]="general"
+)
+for judge_name in "${ALL_JUDGES[@]}"; do
+    load_judge_conf "$judge_name"
+    assert_eq "$JUDGE_OUTPUT_ID" "${EXPECTED_OFFICIAL_IDS[$judge_name]}"
+    assert_eq "$JUDGE_MODEL" "claude-opus-5[1m]"
+    assert_eq "$JUDGE_REASONING_EFFORT" "high"
+    assert_eq "$JUDGE_CODEX_VERSION" ""
+done
+load_judge_conf data_contamination_judge
+
+setup_judge_auth "$TMP_ROOT/official/job"
+run_judge_exec "$TMP_ROOT/official/job" "$TMP_ROOT/official/tmp" \
+    "$TMP_ROOT/official/out/judge_output_gpt5_4_rerun.json" "OFFICIAL_PROMPT_SENTINEL"
+collect_judge_output "$TMP_ROOT/official/job" "$TMP_ROOT/official/out" "_rerun" 1
+[ -f "$TMP_ROOT/official/out/judgement_gpt5_4_rerun.json" ] || fail "official judgement missing"
+grep -q 'MOCK_CLAUDE_ARGS --model claude-opus-5\[1m\] --effort high --prompt OFFICIAL_PROMPT_SENTINEL' "$MOCK_APPTAINER_LOG" || \
+    fail "official profile did not invoke Claude Opus 5 high"
+
+# Claude selection changes backend and names, not the judge task/prompt.
+export POST_TRAIN_BENCH_JUDGE_PROFILE="claude"
+export POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL="opus"
+export POST_TRAIN_BENCH_JUDGE_AUTH_MODE="claude_oauth"
+configure_judge_profile
 load_judge_conf data_contamination_judge
 assert_eq "$JUDGE_PROFILE" "claude"
 assert_eq "$PTB_JUDGE_BACKEND" "claude"
 assert_eq "$JUDGE_MODEL" "opus"
-assert_eq "$JUDGE_REASONING_EFFORT" "xhigh"
+assert_eq "$JUDGE_REASONING_EFFORT" "high"
 assert_eq "$JUDGE_OUTPUT_ID" "claude_contamination"
 CLAUDE_PROMPT="$(build_judge_prompt data_contamination_judge gsm8k google/gemma-3-4b-pt claude opus)"
 assert_eq "$CLAUDE_PROMPT" "$OFFICIAL_PROMPT"
@@ -86,7 +96,7 @@ for judge_name in "${ALL_JUDGES[@]}"; do
     load_judge_conf "$judge_name"
     assert_eq "$JUDGE_OUTPUT_ID" "${EXPECTED_CLAUDE_IDS[$judge_name]}"
     assert_eq "$JUDGE_MODEL" "opus"
-    assert_eq "$JUDGE_REASONING_EFFORT" "xhigh"
+    assert_eq "$JUDGE_REASONING_EFFORT" "high"
 done
 load_judge_conf data_contamination_judge
 
@@ -97,13 +107,13 @@ collect_judge_output "$TMP_ROOT/claude/job" "$TMP_ROOT/claude/out" "_rerun" 1
 
 [ -f "$TMP_ROOT/claude/out/judgement_claude_contamination_rerun.json" ] || fail "Claude judgement missing"
 [ ! -e "$TMP_ROOT/claude/out/judgement_gpt5_4_rerun.json" ] || fail "Claude profile wrote a canonical judgement"
-grep -q 'MOCK_CLAUDE_ARGS --model opus --effort xhigh --prompt CLAUDE_PROMPT_SENTINEL' "$MOCK_APPTAINER_LOG" || \
+grep -q 'MOCK_CLAUDE_ARGS --model opus --effort high --prompt CLAUDE_PROMPT_SENTINEL' "$MOCK_APPTAINER_LOG" || \
     fail "Claude command did not receive model/effort/prompt"
 grep -q -- '--safe-mode' "$MOCK_APPTAINER_LOG" || fail "Claude judge did not enable safe mode"
 grep -q -- '--no-session-persistence' "$MOCK_APPTAINER_LOG" || \
     fail "Claude judge did not disable session persistence"
-if grep 'MOCK_CLAUDE_ARGS' "$MOCK_APPTAINER_LOG" | grep -q 'max'; then
-    fail "Claude judge command used max instead of xhigh"
+if grep 'MOCK_CLAUDE_ARGS' "$MOCK_APPTAINER_LOG" | grep -Eq 'effort (max|xhigh)'; then
+    fail "Claude judge command did not uniformly use high"
 fi
 grep -q 'Session start — mock-claude' "$TMP_ROOT/claude/out/judge_output_claude_contamination_rerun.txt" || \
     fail "Claude stream-json was not parsed by claude_parser"
@@ -119,7 +129,7 @@ expected = {
     "auth_mode": "claude_oauth",
     "requested_model": "opus",
     "resolved_model": "opus",
-    "reasoning_effort": "xhigh",
+    "reasoning_effort": "high",
     "container": "opus_5.sif",
     "cli_version": "2.1.219 (Claude Code)",
 }

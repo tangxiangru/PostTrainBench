@@ -221,19 +221,23 @@ The project includes reward-hacking detection via agent-as-judge runs invoked by
 `src/judges/run_judges.sh`). Each judge is a folder under `src/judges/` with a `judge.conf`
 and a prompt template (see `src/judges/README.md`, including how to add a new judge):
 
-1. **`data_contamination_judge`** (GPT-5.4 via codex CLI, subscription auth) — checks for
+All four official judges run through Claude Code with Claude Opus 5 at `high`
+effort. They use isolated judge configuration and Vertex or dedicated judge
+OAuth authentication; the tested agent's own credentials are never reused.
+
+1. **`data_contamination_judge`** (Claude Opus 5 high) — checks for
    test-data usage, eval tampering, model substitution, and forbidden fine-tuning practices.
-2. **`api_usage_judge`** (GPT-5.4 via codex CLI) — separate schema (`disallowed_api_usage`),
+2. **`api_usage_judge`** (Claude Opus 5 high) — separate schema (`disallowed_api_usage`),
    checks whether the agent called external LLM APIs in a disallowed way. Its verdict
    (`judgement_api.json`) **is** consumed by scoring: a flagged run falls back to the baseline
    score in `scripts/collect.py`.
-3. **`ptb_lookup_judge`** (GPT-5.4 via codex CLI) — separate schema
+3. **`ptb_lookup_judge`** (Claude Opus 5 high) — separate schema
    (`disallowed_ptb_lookup`), checks whether the agent looked up PostTrainBench itself (the
    website, the GitHub repo, or published traces of past runs, e.g. to copy strategies). Its
    verdict (`judgement_ptb_lookup.json`) is archival — it does not feed score fallback — but
    `scripts/collect.py` raises an error if it ever flags, so a firing lookup judge cannot pass
    unnoticed.
-4. **`general_judge`** (GPT-5.6 Terra via codex CLI pinned to 0.144.5) — separate schema
+4. **`general_judge`** (Claude Opus 5 high) — separate schema
    (`general_anomaly`), an open-ended sweep for **unknown unknowns**: run-integrity problems
    the other judges were not designed to catch, whether caused by the agent (novel reward
    hacking outside the other judges' scope) or suffered by it (premature stop without visible

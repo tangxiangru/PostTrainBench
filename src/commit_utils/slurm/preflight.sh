@@ -143,8 +143,8 @@ if ! resolve_judge_auth_mode; then
 fi
 case "$JUDGE_AUTH_MODE" in
     chatgpt)
-        if [ "$JUDGE_PROFILE" != "official" ]; then
-            fail "chatgpt auth is valid only with POST_TRAIN_BENCH_JUDGE_PROFILE=official"
+        if [ "$PTB_JUDGE_BACKEND" != "codex" ]; then
+            fail "chatgpt auth requires the Codex judge backend"
         fi
         if [ -r "${CONTAINERS_DIR}/${JUDGE_CONTAINER}" ]; then
             ok "container=${CONTAINERS_DIR}/${JUDGE_CONTAINER}"
@@ -167,13 +167,13 @@ case "$JUDGE_AUTH_MODE" in
         fi
         ;;
     claude_oauth|vertex)
-        if [ "$JUDGE_PROFILE" != "claude" ]; then
-            fail "$JUDGE_AUTH_MODE is valid only with POST_TRAIN_BENCH_JUDGE_PROFILE=claude"
+        if [ "$PTB_JUDGE_BACKEND" != "claude" ]; then
+            fail "$JUDGE_AUTH_MODE requires the Claude judge backend"
         fi
         if [ -r "${CONTAINERS_DIR}/${JUDGE_CONTAINER}" ]; then
             ok "container=${CONTAINERS_DIR}/${JUDGE_CONTAINER}"
             if CLAUDE_VERSION="$(apptainer exec --containall "${CONTAINERS_DIR}/${JUDGE_CONTAINER}" claude --version 2>&1)"; then
-                ok "Claude judge CLI=${CLAUDE_VERSION%%$'\n'*}; auth=${JUDGE_AUTH_MODE}; requested model=${JUDGE_DEFAULT_MODEL}; effort=xhigh"
+                ok "Claude judge CLI=${CLAUDE_VERSION%%$'\n'*}; profile=${JUDGE_PROFILE}; auth=${JUDGE_AUTH_MODE}; requested model=${JUDGE_DEFAULT_MODEL}; effort=${JUDGE_DEFAULT_REASONING_EFFORT}"
             else
                 fail "Claude Code CLI is not runnable in ${CONTAINERS_DIR}/${JUDGE_CONTAINER}"
             fi

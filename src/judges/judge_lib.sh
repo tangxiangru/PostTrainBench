@@ -31,10 +31,9 @@ JUDGES_REPO_ROOT="$(cd "$JUDGES_DIR/../.." && pwd)"
 # All judges, in execution order.
 ALL_JUDGES=(data_contamination_judge api_usage_judge ptb_lookup_judge general_judge)
 
-# Runtime profile. `official` preserves the upstream Codex/GPT judges and
-# canonical output ids. `claude` uses Claude Code with Opus + xhigh and gives
-# every output a separate id, so research verdicts can never be mistaken for
-# canonical benchmark verdicts.
+# Runtime profile. `official` is the canonical Claude Opus 5 + high judge and
+# preserves the output ids consumed by validation and aggregation. `claude`
+# uses the same backend/model/effort with separate research output ids.
 JUDGE_PROFILE=""
 PTB_JUDGE_BACKEND=""
 JUDGE_DEFAULT_MODEL=""
@@ -50,19 +49,16 @@ configure_judge_profile() {
     case "$requested" in
         official)
             JUDGE_PROFILE="official"
-            PTB_JUDGE_BACKEND="codex"
-            JUDGE_DEFAULT_MODEL="gpt-5.4"
-            JUDGE_DEFAULT_REASONING_EFFORT="xhigh"
-            JUDGE_CONTAINER="${POST_TRAIN_BENCH_OFFICIAL_JUDGE_CONTAINER:-gpt_5_5.sif}"
+            PTB_JUDGE_BACKEND="claude"
+            JUDGE_DEFAULT_MODEL="${POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL:-claude-opus-5[1m]}"
+            JUDGE_DEFAULT_REASONING_EFFORT="high"
+            JUDGE_CONTAINER="${POST_TRAIN_BENCH_CLAUDE_JUDGE_CONTAINER:-${POST_TRAIN_BENCH_OFFICIAL_JUDGE_CONTAINER:-opus_5.sif}}"
             ;;
         claude)
             JUDGE_PROFILE="claude"
             PTB_JUDGE_BACKEND="claude"
-            # `opus` is the stable Claude Code alias documented by Anthropic.
-            # Sites that need a dated/pinned Opus 5 id must provide the exact
-            # id accepted by their installed CLI through this env variable.
-            JUDGE_DEFAULT_MODEL="${POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL:-opus}"
-            JUDGE_DEFAULT_REASONING_EFFORT="xhigh"
+            JUDGE_DEFAULT_MODEL="${POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL:-claude-opus-5[1m]}"
+            JUDGE_DEFAULT_REASONING_EFFORT="high"
             JUDGE_CONTAINER="${POST_TRAIN_BENCH_CLAUDE_JUDGE_CONTAINER:-opus_5.sif}"
             ;;
         *)
@@ -81,8 +77,8 @@ configure_judge_profile() {
 # POST_TRAIN_BENCH_JUDGE_AUTH_MODE always wins.
 resolve_judge_auth_mode() {
     local default_mode
-    case "$JUDGE_PROFILE" in
-        official) default_mode="chatgpt" ;;
+    case "$PTB_JUDGE_BACKEND" in
+        codex) default_mode="chatgpt" ;;
         claude)
             case "${CLAUDE_CODE_USE_VERTEX:-${ANTHROPIC_VERTEX:-}}" in
                 1|true|TRUE|yes|YES|on|ON) default_mode="vertex" ;;
@@ -129,15 +125,18 @@ load_judge_conf() {
 
     if [ "$PTB_JUDGE_BACKEND" = "claude" ]; then
         if [ -z "$JUDGE_CLAUDE_OUTPUT_ID" ]; then
-            echo "ERROR: $conf must set JUDGE_CLAUDE_OUTPUT_ID for the claude profile" >&2
+            echo "ERROR: $conf must set JUDGE_CLAUDE_OUTPUT_ID for the Claude backend" >&2
             return 1
         fi
-        JUDGE_LABEL="${JUDGE_CLAUDE_LABEL:-Claude Opus (xhigh) ${JUDGE_LABEL}}"
-        JUDGE_OUTPUT_ID="$JUDGE_CLAUDE_OUTPUT_ID"
-        JUDGE_MODEL="${POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL:-${JUDGE_CLAUDE_MODEL:-opus}}"
-        # The Claude profile is deliberately xhigh. `max` is not an alias for
-        # xhigh and must not leak from an agent's own Claude configuration.
-        JUDGE_REASONING_EFFORT="xhigh"
+        JUDGE_LABEL="${JUDGE_CLAUDE_LABEL:-Claude Opus 5 (high) ${JUDGE_LABEL}}"
+        # The research profile remains isolated. The official profile keeps the
+        # canonical ids even though its runtime backend is now Claude.
+        if [ "$JUDGE_PROFILE" = "claude" ]; then
+            JUDGE_OUTPUT_ID="$JUDGE_CLAUDE_OUTPUT_ID"
+        fi
+        JUDGE_MODEL="${POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL:-${JUDGE_CLAUDE_MODEL:-claude-opus-5[1m]}}"
+        # Every canonical and general judge uses the same requested effort.
+        JUDGE_REASONING_EFFORT="high"
         JUDGE_CODEX_VERSION=""
     fi
 }
@@ -454,7 +453,7 @@ run_judge_exec_claude() {
         --env PATH="/root/.local/bin:/home/ben/.local/bin:$PATH" \
         --env ANTHROPIC_API_KEY="" \
         --env ANTHROPIC_AUTH_TOKEN="" \
-        --env CLAUDE_CODE_EFFORT_LEVEL="xhigh" \
+        --env CLAUDE_CODE_EFFORT_LEVEL="${JUDGE_REASONING_EFFORT}" \
         --env CLAUDE_CONFIG_DIR="/home/ben/.claude-judge" \
         --env PYTHONNOUSERSITE="1" \
         "${auth_env_args[@]}" \

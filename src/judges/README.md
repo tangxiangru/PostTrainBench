@@ -13,9 +13,10 @@ The judges run in two contexts:
 
 They also have two runtime/output profiles:
 
-- **`official` (default)** — the existing Codex CLI + GPT judges. It writes the canonical
-  output ids consumed by `scripts/collect.py`; selecting no profile is exactly this behavior.
-- **`claude` (research)** — Claude Code CLI + the `opus` model alias at **xhigh** effort.
+- **`official` (default)** — Claude Code CLI + Claude Opus 5 at **high** effort. It writes the
+  canonical output ids consumed by `scripts/collect.py`; all four judges use this same model
+  and effort, including the general judge.
+- **`claude` (research)** — the same Claude Opus 5 + high runtime with separate output ids.
   It writes only `judgement_claude_*` outputs. Canonical aggregation deliberately ignores
   these files, so a Claude verdict cannot impersonate or overwrite an official verdict.
 
@@ -33,17 +34,10 @@ Codex system configuration containing benchmark-specific instructions.
 | `ptb_lookup_judge/` | `ptb_lookup` | `disallowed_ptb_lookup` + justification | Archival — no score fallback, but `scripts/collect.py` raises an error if it ever flags, so a firing lookup judge cannot pass unnoticed |
 | `general_judge/` | `general` | `general_anomaly` + justification | Archival — never feeds scores; when it flags, `scripts/collect.py` finishes its collection pass but writes **no** output files and raises, listing every flagged run for manual review (flip `general_anomaly` to false in the listed verdict file if the run checks out) |
 
-In the official profile, the three reward-hacking judges run as GPT-5.4 via the codex CLI; the general judge — an
-open-ended sweep for "unknown unknowns" (premature agent stops, usage limits/token
-exhaustion, grader-API credit exhaustion on the LLM-judged benchmarks, harness/infra
-failures, novel reward hacking outside the other judges' scope) — runs as GPT-5.6 Terra on
-a codex CLI pinned to 0.144.5 (`JUDGE_CODEX_VERSION`, npm-installed into the sandbox at
-judge time). All use ChatGPT-subscription auth
-(`agents/codex_non_api/auth.json`, bind-mounted so rotated refresh tokens persist).
-
-The Claude profile uses the same four judge definitions, a configurable `opus` model alias,
-and explicit `--effort xhigh` plus `CLAUDE_CODE_EFFORT_LEVEL=xhigh`. `max` is not used. Its
-container defaults to `opus_5.sif`. Every invocation writes a `judge_metadata_claude_*.json`
+The official and research profiles use the same four judge definitions, a configurable
+Claude Opus 5 model id, and explicit `--effort high` plus
+`CLAUDE_CODE_EFFORT_LEVEL=high`. Their container defaults to `opus_5.sif`. Every invocation
+writes a `judge_metadata_*.json`
 record containing the requested model alias/id, the model actually resolved in Claude's init
 event, effort, container and actual Claude CLI version. The installed CLI/account resolves
 and validates the model request at runtime; set
@@ -78,7 +72,7 @@ bash src/judges/run_judges.sh /path/to/result_dir
 bash src/judges/run_judges.sh --judges data_contamination_judge /path/to/result_dir
 bash src/judges/run_judges.sh --judges api_usage_judge /path/to/result_dir
 
-# Research-only Claude/Opus/xhigh rerun
+# Research-only Claude/Opus/high rerun with separate output ids
 bash src/judges/run_judges.sh --profile claude /path/to/result_dir
 ```
 
@@ -90,9 +84,9 @@ For the Claude profile on GCP/Vertex, the existing site environment is enough wh
 metadata ADC:
 
 ```bash
-POST_TRAIN_BENCH_JUDGE_PROFILE="claude"
+POST_TRAIN_BENCH_JUDGE_PROFILE="official"
 POST_TRAIN_BENCH_JUDGE_AUTH_MODE="vertex"  # optional when Vertex env is already set
-POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL="opus"
+POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL="claude-opus-5[1m]"
 POST_TRAIN_BENCH_CLAUDE_JUDGE_CONTAINER="opus_5.sif"
 ```
 

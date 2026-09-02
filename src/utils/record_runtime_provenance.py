@@ -97,7 +97,7 @@ def init(args: argparse.Namespace) -> None:
         os.environ["POST_TRAIN_BENCH_CONTAINER_NAME"] + ".sif"
     )
     judge_image = Path(os.environ["POST_TRAIN_BENCH_CONTAINERS_DIR"]) / os.environ.get(
-        "POST_TRAIN_BENCH_OFFICIAL_JUDGE_CONTAINER", "gpt_5_5.sif"
+        "POST_TRAIN_BENCH_OFFICIAL_JUDGE_CONTAINER", "opus_5.sif"
     )
     evaluation_image = (
         Path(os.environ["POST_TRAIN_BENCH_CONTAINERS_DIR"]) / "vllm_debug.sif"

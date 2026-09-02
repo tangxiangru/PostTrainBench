@@ -14,8 +14,8 @@
 #      (separate `disallowed_ptb_lookup` schema; archival, but
 #      scripts/collect.py errors out if it ever flags)
 #   4. general_judge            -> judgement_general_rerun.json
-#      (separate `general_anomaly` schema; GPT-5.6-Terra unknown-unknowns
-#      sweep on codex 0.144.5 — archival, but when it flags,
+#      (separate `general_anomaly` schema; Claude Opus 5 high unknown-unknowns
+#      sweep — archival, but when it flags,
 #      scripts/collect.py finishes its collection pass without writing any
 #      files and errors out listing the flagged runs)
 #
@@ -30,7 +30,8 @@
 #              e.g. --judges data_contamination_judge
 #                   --judges api_usage_judge
 #   --profile  Judge runtime/output profile (default: .env or official).
-#              The claude profile writes separate judgement_claude_* files.
+#              Both use Claude Opus 5 high; the claude research profile writes
+#              separate judgement_claude_* files.
 
 set -e
 
@@ -174,7 +175,7 @@ prepare_judge_sandbox "$JOB_DIR" "$BENCHMARK" "$RESULT_DIR/final_model/config.js
 setup_judge_auth "$JOB_DIR"
 
 JUDGE_LOCK_HELD=0
-if [ "$JUDGE_PROFILE" = "official" ]; then
+if [ "$JUDGE_AUTH_MODE" = "chatgpt" ]; then
     JUDGE_LOCK_FILE="${POST_TRAIN_BENCH_JUDGE_LOCK_FILE:-}"
     if [ -z "$JUDGE_LOCK_FILE" ]; then
         echo "ERROR: POST_TRAIN_BENCH_JUDGE_LOCK_FILE is required for official judges" >&2

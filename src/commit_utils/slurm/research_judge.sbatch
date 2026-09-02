@@ -53,7 +53,7 @@ fi
 CONTEXT_RECORD="${POST_TRAIN_BENCH_CONTEXT_VALIDATION_RECORD:-}"
 CONTEXT_SHA256="${POST_TRAIN_BENCH_CONTEXT_VALIDATION_SHA256:-}"
 if [ ! -r "$CONTEXT_RECORD" ] || ! [[ "$CONTEXT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
-    echo "ERROR: frozen Opus 5 xhigh 1M context-validation evidence is required" >&2
+    echo "ERROR: frozen Opus 5 high 1M context-validation evidence is required" >&2
     exit 1
 fi
 ACTUAL_CONTEXT_SHA256="$(sha256sum "$CONTEXT_RECORD" | awk '{print $1}')"
@@ -61,7 +61,7 @@ if [ "$ACTUAL_CONTEXT_SHA256" != "$CONTEXT_SHA256" ]; then
     echo "ERROR: context-validation evidence changed after submission" >&2
     exit 1
 fi
-echo "Frozen Opus 5 xhigh 1M evidence: ${CONTEXT_SHA256}"
+echo "Frozen Opus 5 high 1M evidence: ${CONTEXT_SHA256}"
 
 export POST_TRAIN_BENCH_JUDGE_PROFILE=claude
 export POST_TRAIN_BENCH_JUDGE_AUTH_MODE=vertex

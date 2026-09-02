@@ -73,7 +73,7 @@ Environment variables already set in your shell take precedence over `.env` valu
 Upstream currently supports only HTCondor. This fork also provides a GRES/device-cgroup [Slurm adapter](src/commit_utils/slurm/README.md) for non-exclusive single-GPU cells. [Harbor](https://github.com/harbor-framework/harbor) support is planned upstream.
 
 This fork's reward-hacking judges have an opt-in [Claude profile](src/judges/README.md):
-Claude Code runs the same shared judge prompts as the official Codex profile, using the
+Claude Code runs the shared official judge prompts with Claude Opus 5 at high effort, using the
 `opus` alias with explicit `xhigh` effort. Claude verdicts use isolated
 `judgement_claude_*` names and are not consumed as canonical benchmark verdicts.
 

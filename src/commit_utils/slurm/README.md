@@ -19,20 +19,20 @@ POST_TRAIN_BENCH_SLURM_TIME_OVERHEAD_MINUTES="240"
 POST_TRAIN_BENCH_SLURM_GPU_MODE="gres"
 ```
 
-Judge profiles are scheduler-independent. The default remains the official
-Codex/GPT profile. To run the research Claude profile on these GCP nodes, use
+Judge profiles are scheduler-independent. The official default is Claude Opus
+5 at high effort and writes canonical verdicts. On these GCP nodes it uses
 Vertex/GCE metadata ADC and the installed `opus_5.sif`:
 
 ```bash
-POST_TRAIN_BENCH_JUDGE_PROFILE="claude"
+POST_TRAIN_BENCH_JUDGE_PROFILE="official"
 POST_TRAIN_BENCH_JUDGE_AUTH_MODE="vertex"
-POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL="opus"
+POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL="claude-opus-5[1m]"
 POST_TRAIN_BENCH_CLAUDE_JUDGE_CONTAINER="opus_5.sif"
 # GCE metadata ADC is used automatically. Only non-GCE/file-backed ADC needs:
 # POST_TRAIN_BENCH_VERTEX_ADC_FILE="/secure/path/google-application-credentials.json"
 ```
 
-The Claude judge runs through Claude Code with explicit `xhigh` effort. GCE
+The Claude judge runs through Claude Code with explicit `high` effort. GCE
 metadata credentials are node-local and require no secret file. If a different
 site uses file-backed ADC or Anthropic OAuth, that credential must be judge-only,
 outside the repository, and visible at the same path on every selected node.
@@ -126,11 +126,12 @@ Formal runs should also set:
 ```bash
 POST_TRAIN_BENCH_REQUIRE_COMPLETE=1
 POST_TRAIN_BENCH_EVAL_GPU_REAP=own
-POST_TRAIN_BENCH_CODEX_JUDGE_AUTH_FILE="$HOME/.codex/auth.json"
-POST_TRAIN_BENCH_JUDGE_LOCK_FILE="/shared/ptb-locks/official-judges.lock"
+POST_TRAIN_BENCH_JUDGE_AUTH_MODE="vertex"
+POST_TRAIN_BENCH_CLAUDE_JUDGE_MODEL="claude-opus-5[1m]"
+POST_TRAIN_BENCH_CLAUDE_JUDGE_CONTAINER="opus_5.sif"
 ```
 
-The completion contract requires `final_model/config.json`, `metrics.json`, and all four canonical official verdicts. Runtime provenance records the source commits, Slurm allocation/GPU UUID, agent model/context/effort/provider, CLI version, and agent/judge SIF digests. Shared ChatGPT subscription auth is protected by the cross-node lock for the entire official judge phase.
+The completion contract requires `final_model/config.json`, `metrics.json`, and all four canonical official verdicts. Runtime provenance records the source commits, Slurm allocation/GPU UUID, agent model/context/effort/provider, CLI version, and agent/judge SIF digests.
 
 Claude Vertex experiment profiles freeze effort and requested context together. The reusable Opus
 profiles are `claude_vertex_max`, `claude_vertex_xhigh`, and `claude_vertex_high` for 1M context,
@@ -156,9 +157,9 @@ G1 checks two simultaneous allocations, H100 visibility and device cgroups. G2 c
   spec/batch/cell/commit identity in a receipt. Never cancel jobs by username or a generic prefix.
 
 - The adapter submits one benchmark cell at a time. A project-level experiment launcher may submit several cells; Slurm distributes them across eligible nodes.
-- A full official run still requires the agent/eval/judge SIFs, task `test_data.json`, model access, agent credentials, ChatGPT judge auth, and a real-provider context-validation record when that gate is enabled.
+- A full official run still requires the agent/eval/judge SIFs, task `test_data.json`, model access, agent credentials, Vertex judge auth, and a real-provider context-validation record when that gate is enabled.
 - A Claude-profile run requires `opus_5.sif`, a working Claude Code binary, and either Vertex ADC (GCE metadata on this cluster) or a dedicated Claude judge OAuth token. Preflight records the CLI version and requested model alias/id but does not spend a model request to resolve the alias; the real judge invocation validates it.
-- `POST_TRAIN_BENCH_JUDGE_AUTH_MODE=skip` is smoke-only. `apikey` remains unsupported; profile defaults are `chatgpt` for official, `vertex` for Claude when Vertex env is present, and otherwise `claude_oauth`.
+- `POST_TRAIN_BENCH_JUDGE_AUTH_MODE=skip` is smoke-only. `apikey` remains unsupported; Claude-backed profiles default to `vertex` when Vertex env is present and otherwise `claude_oauth`.
 - Do not run the worker directly on a shared/login node. Evaluation cleanup is restricted to the current Slurm GPU allocation and current Unix user; setting the reaper to a whole-node mode is unsupported.
 
 ## Extra sandbox binds

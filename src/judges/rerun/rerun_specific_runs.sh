@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Rerun the GPT-5.4 judges (contamination + API) on a hand-picked list of result
+# Rerun the canonical Claude Opus 5 high judges (contamination + API) on a hand-picked list of result
 # directories. Throttles via an HTCondor concurrency-limit tag so we don't race
 # the codex auth.json refresh-token rotation.
 #
@@ -29,7 +29,7 @@
 # Notes:
 #   - Run from the repo root (the .sub files use repo-relative script paths).
 #   - logs/ must exist (mkdir -p logs once).
-#   - agents/codex_non_api/auth.json must exist (ChatGPT Pro auth for GPT-5.4).
+#   - the configured official Claude judge auth must be available.
 
 set -e
 

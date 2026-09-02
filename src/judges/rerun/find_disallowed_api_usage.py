@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Find result directories where the GPT-5.4 API-usage judge flagged disallowed
+Find result directories where the canonical API-usage judge flagged disallowed
 third-party LLM API usage.
 
 Only the latest run (highest cluster_id) per (method, benchmark, base-model)

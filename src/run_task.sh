@@ -360,9 +360,9 @@ solve_task() {
 }
 
 # ---------- judge auth/profile precheck ----------
-# The official profile keeps the Codex/ChatGPT judge path. The research-only
-# claude profile uses a separate OAuth-token file and never reads the tested
-# agent's Claude home or token.
+# Both official and research profiles use an isolated Claude Opus 5 judge.
+# Official outputs keep the canonical ids; the research profile keeps separate
+# ids. Neither reads the tested agent's Claude home or token.
 
 echo "================================"
 echo "======= JUDGE AUTH CHECK ======="
@@ -381,8 +381,8 @@ apikey)
     exit 1
     ;;
 chatgpt)
-    if [ "$JUDGE_PROFILE" != "official" ]; then
-        echo "ERROR: chatgpt auth belongs to the official judge profile; use claude_oauth for profile=claude" >&2
+    if [ "$PTB_JUDGE_BACKEND" != "codex" ]; then
+        echo "ERROR: chatgpt auth requires the Codex judge backend" >&2
         exit 1
     fi
     if [ ! -f "$JUDGE_AUTH" ]; then
@@ -404,8 +404,8 @@ chatgpt)
     echo "Judge OAuth OK (HTTP 200)"
     ;;
 claude_oauth|vertex)
-    if [ "$JUDGE_PROFILE" != "claude" ]; then
-        echo "ERROR: $JUDGE_AUTH_MODE belongs to the claude judge profile; use chatgpt for profile=official" >&2
+    if [ "$PTB_JUDGE_BACKEND" != "claude" ]; then
+        echo "ERROR: $JUDGE_AUTH_MODE requires the Claude judge backend" >&2
         exit 1
     fi
     if [ "$JUDGE_AUTH_MODE" = "claude_oauth" ]; then
@@ -433,7 +433,7 @@ claude_oauth|vertex)
         exit 1
     fi
     CLAUDE_JUDGE_VERSION="$(apptainer exec --containall "$CLAUDE_JUDGE_IMAGE" claude --version 2>&1 | head -n 1)"
-    echo "Claude judge ready; profile=claude auth=${JUDGE_AUTH_MODE} model=${JUDGE_DEFAULT_MODEL} effort=xhigh cli=${CLAUDE_JUDGE_VERSION:-unknown}"
+    echo "Claude judge ready; profile=${JUDGE_PROFILE} auth=${JUDGE_AUTH_MODE} model=${JUDGE_DEFAULT_MODEL} effort=${JUDGE_DEFAULT_REASONING_EFFORT} cli=${CLAUDE_JUDGE_VERSION:-unknown}"
     ;;
 *)
     echo "ERROR: unknown POST_TRAIN_BENCH_JUDGE_AUTH_MODE='${JUDGE_AUTH_MODE}' (want chatgpt|claude_oauth|vertex|skip)" >&2
@@ -534,10 +534,10 @@ prepare_judge_sandbox "${JOB_DIR}" "${EVALUATION_TASK}" "${EVAL_DIR}/final_model
 # separate CLAUDE_CONFIG_DIR and disables user/project/local setting sources.
 setup_judge_auth "${JOB_DIR}" || exit 1
 
-# ChatGPT subscription auth rotates a single-use refresh token. Serialize the
-# complete canonical judge phase whenever several cells share one auth file.
+# ChatGPT subscription auth rotates a single-use refresh token. Serialize only
+# that legacy auth path; Vertex-backed official Claude judges can run in parallel.
 JUDGE_LOCK_HELD=0
-if [ "$JUDGE_PROFILE" = "official" ]; then
+if [ "$JUDGE_AUTH_MODE" = "chatgpt" ]; then
     JUDGE_LOCK_FILE="${POST_TRAIN_BENCH_JUDGE_LOCK_FILE:-}"
     if [ -z "$JUDGE_LOCK_FILE" ]; then
         echo "ERROR: POST_TRAIN_BENCH_JUDGE_LOCK_FILE is required for official judges" >&2
