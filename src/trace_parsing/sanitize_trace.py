@@ -23,13 +23,20 @@ def _strip_quotes(value: str) -> str:
     return value
 
 
-def load_api_key_secrets(env_path: Path = DEFAULT_ENV_PATH) -> dict[str, str]:
+def configured_env_path() -> Path:
+    """Use the site env explicitly forwarded into frozen git-archive runs."""
+
+    return Path(os.environ.get("POST_TRAIN_BENCH_ENV_FILE", DEFAULT_ENV_PATH))
+
+
+def load_api_key_secrets(env_path: Path | None = None) -> dict[str, str]:
     """Return name → value for every *_API_KEY entry in .env with a real value.
 
     Prefers the live environment value (so an override via the shell wins) and
     falls back to the literal value written in the .env file. Placeholders
     (`your-*`) and values shorter than MIN_VALUE_LEN are skipped.
     """
+    env_path = Path(env_path) if env_path is not None else configured_env_path()
     if not env_path.exists():
         raise SystemExit(f".env file not found at {env_path}")
 
@@ -86,8 +93,11 @@ def main() -> None:
     parser.add_argument(
         "--env-file",
         type=Path,
-        default=DEFAULT_ENV_PATH,
-        help=f"Path to the .env file (default: {DEFAULT_ENV_PATH}).",
+        default=None,
+        help=(
+            "Path to the .env file (default: POST_TRAIN_BENCH_ENV_FILE, "
+            f"otherwise {DEFAULT_ENV_PATH})."
+        ),
     )
     args = parser.parse_args()
 
