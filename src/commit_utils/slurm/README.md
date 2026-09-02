@@ -160,3 +160,13 @@ G1 checks two simultaneous allocations, H100 visibility and device cgroups. G2 c
 - A Claude-profile run requires `opus_5.sif`, a working Claude Code binary, and either Vertex ADC (GCE metadata on this cluster) or a dedicated Claude judge OAuth token. Preflight records the CLI version and requested model alias/id but does not spend a model request to resolve the alias; the real judge invocation validates it.
 - `POST_TRAIN_BENCH_JUDGE_AUTH_MODE=skip` is smoke-only. `apikey` remains unsupported; profile defaults are `chatgpt` for official, `vertex` for Claude when Vertex env is present, and otherwise `claude_oauth`.
 - Do not run the worker directly on a shared/login node. Evaluation cleanup is restricted to the current Slurm GPU allocation and current Unix user; setting the reaper to a whole-node mode is unsupported.
+
+## Extra sandbox binds
+
+`POST_TRAIN_BENCH_EXTRA_BINDS="src:dst[:ro],src2:dst2"` adds one `--bind` per
+comma-separated entry to the agent sandbox only, never to the evaluation or
+judge containers. It is read on the host by `run_task.sh`; nothing about it
+reaches the sandbox environment, and a missing source is an error before the
+agent starts. Unset or empty, the default, changes nothing. A study uses it to
+mount its own read-only code or data next to the task; `agents/claude_vertex_max_awm`
+expects a checkout of `agentic-world-model` at `/home/ben/awm` this way.

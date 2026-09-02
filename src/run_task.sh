@@ -303,6 +303,27 @@ solve_task() {
         export NVIDIA_VISIBLE_DEVICES="${POST_TRAIN_BENCH_VISIBLE_GPUS}"
         NVCCLI_ARGS=(--nvccli)
     fi
+    # --- extra binds (begin) ---
+    # POST_TRAIN_BENCH_EXTRA_BINDS="src:dst[:ro],src2:dst2" adds one bind per
+    # comma-separated entry to the agent sandbox only (not to evaluation or the
+    # judges). It is read on the host; nothing about it reaches the sandbox
+    # environment. Unset or empty, the default, changes nothing. A study uses it
+    # to mount its own read-only code or data next to the task.
+    EXTRA_BIND_ARGS=()
+    if [ -n "${POST_TRAIN_BENCH_EXTRA_BINDS:-}" ]; then
+        IFS=',' read -r -a _extra_binds <<< "${POST_TRAIN_BENCH_EXTRA_BINDS}"
+        for _bind in "${_extra_binds[@]}"; do
+            [ -n "$_bind" ] || continue
+            _bind_src="${_bind%%:*}"
+            if [ ! -e "$_bind_src" ]; then
+                echo "ERROR: POST_TRAIN_BENCH_EXTRA_BINDS source does not exist: ${_bind_src}" >&2
+                exit 1
+            fi
+            EXTRA_BIND_ARGS+=(--bind "$_bind")
+        done
+        echo "Extra sandbox binds: ${POST_TRAIN_BENCH_EXTRA_BINDS}"
+    fi
+    # --- extra binds (end) ---
     timeout --signal=TERM --kill-after=30s "$((NUM_HOURS * 60 + 5))m" \
     apptainer exec \
         --nv \
@@ -327,6 +348,7 @@ solve_task() {
         "${CLI_UPDATE_ENV[@]}" \
         --bind "${JOB_TMP}:/tmp" \
         --bind "${HF_MERGED}:${HF_HOME_NEW}" \
+        "${EXTRA_BIND_ARGS[@]}" \
         "${AGENT_AUTH_BIND[@]}" \
         "${CURSOR_AUTH_BIND[@]}" \
         "${GROK_AUTH_BIND[@]}" \
