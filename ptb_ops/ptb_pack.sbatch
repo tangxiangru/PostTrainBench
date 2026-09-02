@@ -89,6 +89,30 @@ source src/commit_utils/set_env_vars.sh
 unset HUGGINGFACE_HUB_CACHE HF_HUB_CACHE
 echo "hf_home=${HF_HOME:-<unset>} hub_cache_overrides=cleared"
 
+# The answer key must not be in the cache the cells can list.
+#
+# RTT1/posttrainbench-gsm8k-recipes is one shipped post-training recipe per agent
+# run for this exact task. It was pulled into $HF_HOME on 2026-08-30 and sat there
+# for three days; four cells found it and declined, and on 2026-09-02 two cells in
+# 89727/89809 opened it and mined it -- both landed in r2's top three. It is now
+# private on the Hub and quarantined at ~/ptb-answer-key-quarantine.
+#
+# A cell runs as me, so this is not a fence: it removes the discovery path that was
+# actually used (`ls $HF_HOME/hub`) and it stops a re-download from going unnoticed.
+# `datasets` keeps a SECOND copy under $HF_HOME/datasets/<owner>___<name>, so check
+# both roots -- checking only hub/ is how the first sweep missed half of it.
+_ak_hits=""
+for _r in "${HF_HOME:-/nonexistent}/hub" "${HF_HOME:-/nonexistent}/datasets"; do
+    _ak_hits+="$(find "$_r" -maxdepth 1 -iname '*posttrainbench*recipes*' 2>/dev/null)"$'\n'
+done
+if [ -n "${_ak_hits//[$'\n'[:space:]]/}" ]; then
+    echo "FATAL: the gsm8k answer key is back in HF_HOME -- this pack would be contaminated" >&2
+    echo "$_ak_hits" | sed '/^[[:space:]]*$/d' >&2
+    echo "move it to ~/ptb-answer-key-quarantine before resubmitting" >&2
+    exit 1
+fi
+echo "answer_key_in_hf_home=no"
+
 # Echo the two settings that decide whether a packed cell can work at all, so a
 # post-mortem does not have to reconstruct them from .env as it was hours later.
 echo "isolate_gpus=${POST_TRAIN_BENCH_ISOLATE_GPUS:-<unset>} eval_gpu_reap=${POST_TRAIN_BENCH_EVAL_GPU_REAP:-<unset>}"
