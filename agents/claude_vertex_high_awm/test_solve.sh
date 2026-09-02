@@ -23,7 +23,11 @@ def main():
     if sys.argv[1:3] == ["sandbox", "setup"]:
         with open(os.path.join(os.getcwd(), "setup_args.txt"), "w") as f:
             f.write(" ".join(sys.argv[3:]) + "\n")
-        os.makedirs(os.path.join(os.getcwd(), ".claude", "skills", "stub"), exist_ok=True)
+        if "--exp-protocol" in sys.argv[3:]:
+            skill = os.path.join(os.getcwd(), ".claude", "skills", "exp_protocol")
+            os.makedirs(skill, exist_ok=True)
+            with open(os.path.join(skill, "SKILL.md"), "w") as f:
+                f.write("# Experiment protocol\n")
         return 0
     return 2
 if __name__ == "__main__":
@@ -57,10 +61,30 @@ grep -qx -- "--setting-sources" "$T/claude.args" && grep -qx -- "project" "$T/cl
     || fail "claude was not started with --setting-sources project"
 grep -qx -- "claude-opus-5\[1m\]" "$T/claude.args" || fail "claude did not get --model \$AGENT_CONFIG"
 grep -qx -- "--effort" "$T/claude.args" && grep -qx -- "high" "$T/claude.args" || fail "claude did not get --effort high"
-[ "$(cat "$T/claude.stdin")" = "post-train the model" ] || fail "the prompt did not reach claude's stdin verbatim"
+grep -q "MANDATORY SCIENTIST BOOTSTRAP" "$T/claude.stdin" || fail "protocol bootstrap was not prepended"
+grep -q 'first tool/skill action MUST be to invoke the `exp_protocol` skill' "$T/claude.stdin" \
+    || fail "bootstrap does not require exp_protocol as the first action"
+grep -q 'successful `awm exp_protocol lock`' "$T/claude.stdin" \
+    || fail "bootstrap does not gate training on a successful lock"
+grep -q "PTB TASK:" "$T/claude.stdin" && grep -q "post-train the model" "$T/claude.stdin" \
+    || fail "the original PTB prompt did not follow the bootstrap"
 [ -x "$T/home/.local/bin/awm" ] || fail "awm entry script not written"
 grep -q "sha=0123abcd" "$T/solve.out" || fail "checkout sha not echoed"
 grep -q "version: stub" "$T/home/cli_version.txt" || fail "update_agent_cli.sh was not run"
+
+# matched null control: same scaffold without an installed protocol must not
+# mention the protocol or alter PTB's prompt.
+rm -rf -- "$T/home/task/.claude"
+export AWM_SANDBOX_SETUP="--tool claude"
+: > "$T/claude.stdin"
+(cd "$T/home/task" && bash "$HERE/solve.sh" > "$T/null.out" 2>&1) \
+    || { cat "$T/null.out"; fail "null-control solve.sh exited non-zero"; }
+[ "$(cat "$T/claude.stdin")" = "post-train the model" ] \
+    || fail "null-control prompt was altered: $(cat "$T/claude.stdin")"
+! grep -q "exp_protocol" "$T/claude.stdin" || fail "null control was told about exp_protocol"
+
+# restore the protocol setup for the refusal cases below.
+export AWM_SANDBOX_SETUP="--exp-protocol --tool claude"
 
 # refusals
 ( unset AWM_SANDBOX_SETUP; cd "$T/home/task" && bash "$HERE/solve.sh" >/dev/null 2>&1 ) && fail "ran without AWM_SANDBOX_SETUP" || true

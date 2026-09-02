@@ -51,7 +51,28 @@ export CLAUDE_CODE_EFFORT_LEVEL="high"
 
 bash "${SANDBOX_HOME}/update_agent_cli.sh" claude
 
-printf '%s' "$PROMPT" | claude --print --verbose \
+# The exp_protocol study is opt-in: a null-control cell runs this same scaffold
+# without installing the skill and must receive PTB's prompt unchanged.  When
+# the skill is present, make protocol discovery the scientist's first action;
+# relying on passive skill discovery is too weak (an agent can read the skill
+# later, after it has already launched training).
+SCIENTIST_PROMPT="$PROMPT"
+if [ -r "${TASK_DIR}/.claude/skills/exp_protocol/SKILL.md" ]; then
+    read -r -d '' PROTOCOL_BOOTSTRAP <<'EOF' || true
+MANDATORY SCIENTIST BOOTSTRAP — do this before the PTB task:
+Your first tool/skill action MUST be to invoke the `exp_protocol` skill and read
+`skills/exp_protocol/SKILL.md` completely, including the resources it directs you to read.
+Do not inspect the repository, edit files, or run any other command before that first action.
+Before any model-training or evaluation command, create and fill the experiment card,
+run `awm exp_protocol check`, and obtain a successful `awm exp_protocol lock`.
+Only after the lock succeeds may you continue with the PTB task below.
+
+PTB TASK:
+EOF
+    SCIENTIST_PROMPT="${PROTOCOL_BOOTSTRAP}"$'\n'"${PROMPT}"
+fi
+
+printf '%s' "$SCIENTIST_PROMPT" | claude --print --verbose \
     --model "$AGENT_CONFIG" \
     --effort high \
     --output-format stream-json \
