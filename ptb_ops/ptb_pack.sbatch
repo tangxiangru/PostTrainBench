@@ -174,33 +174,20 @@ if [ ! -s "${_TD}" ]; then
 fi
 echo "test_data=${_TD} bytes=$(stat -c%s "${_TD}")"
 
-# Default scratch to the node-local SSD array rather than /tmp. A packed cell holds
-# 12-55G of merged HuggingFace weights and overlay upperdirs, and the a3 boot disk is
-# a 200G PD that /tmp shares with the OS: eight concurrent cells took it to 43G free
-# on 2026-09-02 and the next pack would have hit ENOSPC mid-training. /mnt/localssd is
-# 5.9T of RAID0 NVMe on the same node, so this is more room on faster disk.
-#
-# Guarded rather than assumed: only take it if it is a real mountpoint (an unmounted
-# /mnt/localssd would silently write to the root fs we are trying to spare) with room
-# to spare. Anything else falls back to /tmp and says so, because a node that quietly
-# scratches somewhere unexpected is worse than a slow one.
-if [ -z "${POST_TRAIN_BENCH_TMP_ROOT:-}" ]; then
-    _LSSD_FREE_G=0
-    if mountpoint -q /mnt/localssd 2>/dev/null; then
-        _LSSD_FREE_G=$(df -BG --output=avail /mnt/localssd 2>/dev/null | tail -1 | tr -dc '0-9')
-    fi
-    if [ "${_LSSD_FREE_G:-0}" -ge 500 ] 2>/dev/null; then
-        export POST_TRAIN_BENCH_TMP_ROOT="/mnt/localssd/tmp/ptb"
-        echo "scratch_root=localssd free=${_LSSD_FREE_G}G"
-    else
-        echo "scratch_root=/tmp reason=localssd_unusable free=${_LSSD_FREE_G}G"
-    fi
-fi
-
 SCRATCH="${POST_TRAIN_BENCH_TMP_ROOT:-/tmp}"
 mkdir -p "$SCRATCH" || { echo "FATAL: cannot create $SCRATCH on $(hostname)" >&2; exit 1; }
 [ -w "$SCRATCH" ] || { echo "FATAL: $SCRATCH is not writable on $(hostname)" >&2; exit 1; }
 echo "scratch=$SCRATCH free=$(df -h "$SCRATCH" | tail -1 | awk '{print $4}')"
+
+# A cell holds 12-55G of weights and overlay upperdirs here, and on a3 the /tmp
+# fallback is the 200G boot PD shared with the OS -- eight concurrent cells took it
+# to 42G free on 2026-09-02. set_env_vars.sh points this at /mnt/localssd when the
+# node has one; if we still landed on the boot disk, say so loudly rather than
+# discovering it from an ENOSPC nine hours into training.
+case "$SCRATCH" in
+    /tmp*) echo "WARNING: scratch is on the boot disk, not local SSD."
+           echo "         localssd_mounted=$(mountpoint -q /mnt/localssd 2>/dev/null && echo yes || echo no)" ;;
+esac
 
 # Run the driver from node-local disk, because bash reads a script incrementally and a
 # `git commit` in this checkout replaces the inode under a running job. See
