@@ -170,4 +170,5 @@ judge containers. It is read on the host by `run_task.sh`; nothing about it
 reaches the sandbox environment, and a missing source is an error before the
 agent starts. Unset or empty, the default, changes nothing. A study uses it to
 mount its own read-only code or data next to the task; `agents/claude_vertex_max_awm`
-expects a checkout of `agentic-world-model` at `/home/ben/awm` this way.
+and `agents/claude_vertex_high_awm` (the same scaffold at effort high)
+expect a checkout of `agentic-world-model` at `/home/ben/awm` this way.
