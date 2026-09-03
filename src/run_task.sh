@@ -864,6 +864,61 @@ if [ -f "${JOB_DIR}/task/system_monitor.log" ]; then
     cp "${JOB_DIR}/task/system_monitor.log" "$EVAL_DIR/system_monitor.log"
 fi
 
+# `delete_hf_models.py` walks `task/` and removes EVERY HuggingFace model
+# folder it finds -- `runs/sft1`, `runs/grpo1/checkpoint-N`, all of them -- and
+# it runs before the `cp -r` below, so whatever it deletes never reaches the
+# results filesystem. That is right when `final_model` shipped: the weights are
+# already stored once and keeping the intermediates would store them again.
+#
+# It is wrong when `final_model` did NOT ship. On 2026-09-03 two cells of
+# ptb-g3 (`91037_g1`, `91039_g4`) ended `exit_code: 0` with
+# `final_model_files: 0` -- their agents ended a turn mid-training and the CLI
+# killed the background job -- and this line then deleted `runs/sft1` and
+# `runs/grpo1/checkpoint-100`, the only weights those cells ever had. The
+# mid-run snapshot could not cover them either: `snapshot_final_model_daemon`
+# watches `final_model` and `has_model_weights "$src" || continue`, so a cell
+# that never writes that directory gets no snapshot. Both cells went to nine
+# failed `final_eval` attempts, no `metrics.json`, and a FAILED pack exit --
+# and because they were unrecoverable, the loss became an arm-asymmetric hole
+# in the board rather than a cell anyone could re-score.
+#
+# So: when nothing shipped, rescue the furthest-along checkpoint first. One
+# checkpoint, not all of them, because the point is a re-scoreable artefact and
+# not an archive -- and under the same free-space floor the snapshot daemon
+# uses, because the results filesystem is the scarce resource and a run that
+# fills it takes every other cell down with it.
+if ! has_model_weights "$EVAL_DIR/final_model" \
+   && ! has_model_weights "$EVAL_DIR/final_model_snapshot"; then
+    rescue_min_free="${POST_TRAIN_BENCH_SNAPSHOT_MIN_FREE_GIB:-200}"
+    rescue_avail=$(df -BG --output=avail "$EVAL_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')
+    # Newest mtime, not largest or highest-numbered: checkpoints of one run are
+    # the same size, and `checkpoint-40` from a second GRPO restart is further
+    # along than `checkpoint-250` from an abandoned first one.
+    rescue_src=$(find "${JOB_DIR}/task" -type f -name '*.safetensors' -printf '%T@ %h\n' 2>/dev/null \
+                 | sort -rn | head -1 | cut -d' ' -f2-)
+    if [ -z "$rescue_src" ]; then
+        echo "WARNING: no final_model and no checkpoint anywhere under ${JOB_DIR}/task; this cell ships no weights" >&2
+    elif [ -n "$rescue_avail" ] && [ "$rescue_avail" -lt "$rescue_min_free" ]; then
+        echo "WARNING: no final_model, and only ${rescue_avail}GiB free (floor ${rescue_min_free}GiB); NOT rescuing $rescue_src" >&2
+    elif cp -r "$rescue_src" "$EVAL_DIR/final_model_rescued"; then
+        echo "WARNING: no final_model shipped; RESCUED $rescue_src -> $EVAL_DIR/final_model_rescued" >&2
+        # Say what it is, so nobody re-scores an intermediate checkpoint into a
+        # board column as if the agent had delivered it.
+        cat > "$EVAL_DIR/final_model_rescued/RESCUE_MANIFEST.json" <<RESCUE
+{
+  "rescued_from": "$rescue_src",
+  "reason": "solve finished with no final_model; these are the cell's only weights",
+  "rescued_at": "$(date -u +%FT%TZ)",
+  "is_shipped_model": false,
+  "scoreable_as_a_board_cell": false
+}
+RESCUE
+    else
+        echo "WARNING: no final_model, and the rescue cp of $rescue_src FAILED" >&2
+        rm -rf "$EVAL_DIR/final_model_rescued" 2>/dev/null
+    fi
+fi
+
 python containers/delete_hf_models.py "${JOB_DIR}/task"
 
 cp -r "${JOB_DIR}/task" "$EVAL_DIR/task"
