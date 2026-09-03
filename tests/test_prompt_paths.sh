@@ -53,6 +53,14 @@ has_relative_form() {
     done <<< "$RELATIVE_FORMS"
 }
 
+render_task() {
+    python3 -B src/eval/general/get_prompt.py \
+        --agent claude_vertex --benchmark-id "$1" \
+        --model-to-train Qwen/Qwen3-1.7B-Base \
+        --num-hours 10 --num-gpus 8 \
+        --sandbox-home-dir "$HOME_DIR" --sandbox-task-dir "$TASK_DIR" 2>/dev/null
+}
+
 CONTROL="$(render claude_vertex)" || { echo "FAIL: control render failed: $CONTROL" >&2; exit 1; }
 AUTOR="$(render claude_autor_b3)"  || { echo "FAIL: autor render failed: $AUTOR" >&2; exit 1; }
 
@@ -93,6 +101,25 @@ if [ "$WANT" != "$GOT" ]; then
     fail "[5] has_relative_form missed a form it is supposed to catch"
     diff <(printf '%s\n' "$WANT") <(printf '%s\n' "$GOT") >&2
 fi
+
+# [6] The inspect-ai bullet tracks the benchmark's actual evaluate.py, for every task
+# in the repo. This replaced a hand-kept INSPECT_EVALS list that had drifted both ways
+# -- it named a task that does not exist and omitted aime2026, which does. The
+# expectation here is DERIVED from the same files rather than written out, because a
+# second hand-kept list in the test would drift in step with the first and agree with
+# it forever.
+BULLET='normal behavior for inspect-ai'
+for task_dir in src/eval/tasks/*/; do
+    task="$(basename "$task_dir")"
+    [ -f "${task_dir}evaluate.py" ] || continue
+    want="$(python3 -B -c "
+import sys; sys.path.insert(0, 'src/utils')
+from graded_read import evaluate_uses_inspect
+print(1 if evaluate_uses_inspect('${task_dir}evaluate.py') else 0)")"
+    got=0
+    if render_task "$task" | grep -qF "$BULLET"; then got=1; fi
+    [ "$want" = "$got" ] || fail "[6] ${task}: evaluate.py inspect=${want} but prompt bullet=${got}"
+done
 
 if [ "$FAILED" -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED" >&2; fi
 exit "$FAILED"
