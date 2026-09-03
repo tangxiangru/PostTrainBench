@@ -105,6 +105,20 @@ Reasoning:
 #: which is ``datasets`` ``.shuffle(seed=42).select(range(10))`` -- the same two calls
 #: :func:`build_fewshot_prefix` makes. Measured: the resulting system message is 5872
 #: characters / 2048 Qwen3 tokens.
+#:
+#: **Do not lower this to buy step time.** It is the single most expensive knob in the
+#: script and it looks like free money: the 2048-token prefix rides on every sequence in
+#: every group, and dropping it takes a step from 28.84 s to 11.00 s -- 2.62x, which over a
+#: ten-hour cell is the difference between 30-60 optimizer steps per RL arm and several
+#: hundred. That trade is not available. The prefix is not a training choice, it is the
+#: graded prompt: confirmed against a real cell's inspect log
+#: (``claude_autor_b3 .../91030_g1/task/logs``), which records
+#: ``task_args: {'fewshot': 10, 'fewshot_seed': 42, 'shuffle_fewshot': True}`` and a system
+#: message of exactly 5872 characters. Train at 0 and the policy is optimised on a context
+#: it never sees at grading, where the prefix is over 80% of the input -- for a 1.7B/4B base
+#: model that is a different task, and the steps bought are steps on the wrong one.
+#: Buy throughput from ``max_completion_length``, the group size, or the number of RL arms,
+#: all of which leave the prompt matched.
 DEFAULT_FEWSHOT = 10
 DEFAULT_FEWSHOT_SEED = 42
 
