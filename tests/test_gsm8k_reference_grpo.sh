@@ -422,15 +422,18 @@ PYBOOL
 # it the suite fails on its own side effect.
 python3 -B "$WORK/boolflag.py" "$REF/train_grpo.py" || fail=1
 
-echo "[10] the termination monitor arms, latches, and leaves an un-armed run alone"
-# The failure this guards is invisible in every number the trainer prints: rollout
-# reward climbs while greedy termination goes to zero, and the cell ships a model
-# that cannot stop. 91039_g7 measured it by hand, concluded no learning rate did
-# both, and shipped its SFT plateau at 73.01 against an 83.2 population. So the
-# state machine is worth pinning directly -- especially the *un*-armed case, which
-# is the entire objection to just defaulting the flag to True.
+echo "[10] the greedy probe arms, halts, and never takes the run down with it"
+# The failure this guards is invisible in every number the trainer prints. 91039_g7
+# had completions/clipped_ratio max 0.086, reward 0.231 -> 0.562 and "no kill
+# criterion fired", and the graded read of that same checkpoint decoded 13,425
+# characters a row into the grader's 4000-token cap and scored 19.41%. The reward is
+# computed on sampled rollouts; the grade is a greedy decode. So the probe generates
+# rather than reading a metric, and the cases worth pinning are the un-armed one
+# (nothing happens), the halt, and every way the probe itself can go wrong -- a probe
+# that can crash a ten-hour run is worse than no probe at all.
 cat > "$WORK/monitor.py" <<'PYMON'
 import importlib.util, sys, types, json, os, tempfile
+import torch
 spec = importlib.util.spec_from_file_location("train_grpo", sys.argv[1])
 m = importlib.util.module_from_spec(spec)
 sys.modules["train_grpo"] = m
@@ -444,89 +447,150 @@ def chk(label, cond):
         bad = 1
 
 Monitor = m._make_termination_monitor_class()
+STOP = 151645
+PROMPT_LEN = 3
 
-class FakeTrainer:
-    def __init__(self):
-        self.mask_truncated_completions = False
+class FakeTok:
+    pad_token_id = 0
+    def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True):
+        return "P"
+    def __call__(self, texts, return_tensors=None, padding=None, padding_side=None):
+        return {"input_ids": torch.ones(len(texts), PROMPT_LEN, dtype=torch.long)}
 
-class FakeState:
-    def __init__(self):
-        self.global_step = 0
+class FakeModel:
+    """Emits `stop_n` sequences that reach STOP and the rest that never do."""
+    def __init__(self, stop_n, total, raises=False):
+        self.stop_n, self.total, self.raises = stop_n, total, raises
+        self.training = True
+        self.calls = 0
+        self.eval_calls = 0
+    def eval(self): self.training = False; self.eval_calls += 1
+    def train(self): self.training = True
+    def parameters(self):
+        return iter([torch.zeros(1)])
+    def generate(self, **kw):
+        self.calls += 1
+        if self.raises:
+            raise RuntimeError("CUDA out of memory (simulated)")
+        new = kw["max_new_tokens"]
+        rows = []
+        for i in range(self.total):
+            body = [7] * new
+            if i < self.stop_n:
+                body[4] = STOP
+            rows.append([1] * PROMPT_LEN + body)
+        return torch.tensor(rows, dtype=torch.long)
 
-def drive(mode, ratios, floor=0.90, bind=True):
-    """Feed a sequence of clipped_ratios through on_log, as the trainer would."""
+def make(stop_n=16, total=16, floor=0.9, steps=5, halt=True, raises=False, prompts=16):
     out = tempfile.mkdtemp()
-    mon = Monitor(mode, floor)
-    tr = FakeTrainer()
-    if bind:
-        mon.bind(tr)
-    args = types.SimpleNamespace(output_dir=out)
-    st, ctl = FakeState(), types.SimpleNamespace()
-    for i, r in enumerate(ratios):
-        st.global_step = i + 1
-        mon.on_log(args, st, ctl, logs={"loss": 0.1, "completions/clipped_ratio": r})
-    mon.on_train_end(args, st, ctl)
-    return mon, tr, out
+    mon = Monitor(floor, steps, prompts, 32, halt=halt, tokenizer=FakeTok(),
+                  prompts=[[{"role": "user", "content": "q"}]] * prompts,
+                  stop_token_id=STOP)
+    model = FakeModel(stop_n, total, raises=raises)
+    args = types.SimpleNamespace(output_dir=out, max_completion_length=512)
+    return mon, model, args, out
 
-# A base model that never learns to stop: clipped stays high the whole way. This is
-# the case the "masking zeroes most of the batch" comment is about, and the answer
-# has to be that nothing happens at all.
-mon, tr, out = drive(m.MASK_AUTO, [1.0, 0.99, 0.97, 0.95, 0.93])
-chk("never-terminating run never arms", mon.armed is False)
-chk("never-terminating run is never masked", tr.mask_truncated_completions is False)
-chk("...and reports no collapse", mon.engaged is False)
+def step(mon, model, args, n):
+    st = types.SimpleNamespace(global_step=n)
+    ctl = types.SimpleNamespace(should_save=False, should_training_stop=False)
+    mon.on_step_end(args, st, ctl, model=model)
+    return ctl
 
-# Learns to stop, then RL takes it away: the 91039_g7 shape.
-mon, tr, out = drive(m.MASK_AUTO, [0.9, 0.5, 0.05, 0.02, 0.40, 0.95, 1.0])
-chk("collapse arms then engages", mon.armed and mon.engaged)
-chk("masking is switched on", tr.mask_truncated_completions is True)
-chk("engaged at the first step below the floor", mon.engaged_step == 5)
-chk("best termination recorded", abs(mon.best - 0.98) < 1e-9)
+# Cadence: the probe is not free, so it must only run on its multiples.
+mon, model, args, out = make(steps=5)
+for n in (1, 2, 3, 4):
+    step(mon, model, args, n)
+chk("no probe off-cadence", model.calls == 0)
+ctl = step(mon, model, args, 5)
+chk("probes on the multiple", model.calls == 1)
+chk("a passing probe arms", mon.armed is True)
+chk("a passing probe checkpoints", ctl.should_save is True)
+chk("...and records where good was", mon.last_good_step == 5)
+chk("the model is put back in training mode", model.training is True)
+chk("...having actually been switched out of it", model.eval_calls == 1)
 
-# Latching: once engaged it must not flap back off, and must not re-fire.
-tr.mask_truncated_completions = False
-st = FakeState(); st.global_step = 99
-mon.on_log(types.SimpleNamespace(output_dir=out), st, types.SimpleNamespace(),
-           logs={"completions/clipped_ratio": 0.99})
-chk("a second dip does not re-fire", mon.engaged_step == 5)
+# The 91039_g7 shape: healthy, then greedy decode stops terminating.
+mon.armed = True
+model.stop_n = 0
+ctl = step(mon, model, args, 10)
+chk("collapse is detected", mon.collapsed is True and mon.collapsed_step == 10)
+chk("training halts", ctl.should_training_stop is True)
+chk("and saves on the way out", ctl.should_save is True)
+chk("the last good step is still readable", mon.last_good_step == 5)
+chk("a collapse marker is written",
+    os.path.exists(os.path.join(out, "grpo_termination_collapse.json")))
+ctl = step(mon, model, args, 15)
+chk("collapse does not re-fire", mon.collapsed_step == 10)
 
-# Explicit False must keep the old behaviour: warn, but never touch the loss.
-mon, tr, out = drive(False, [0.05, 0.02, 0.9])
-chk("explicit False still detects the collapse", mon.engaged is True)
-chk("explicit False never masks", tr.mask_truncated_completions is False)
+# Never healthy: a base model that has not learned to stop is not a model being
+# destroyed, and halting there would kill every run that was going to work.
+mon, model, args, out = make(stop_n=0, steps=5)
+ctl = step(mon, model, args, 5)
+chk("an un-armed failure arms nothing", mon.armed is False)
+chk("an un-armed failure does not halt", ctl.should_training_stop is False)
+chk("...and does not checkpoint", ctl.should_save is False)
+chk("...and is not a collapse", mon.collapsed is False)
 
-# Explicit True is on from step zero and needs no monitor to switch it; main()
-# passes it straight to GRPOConfig, so the monitor must not be what turns it on.
-chk("mask_at_start is True only for the boolean",
-    (m.parse_args(["--mask-truncated-completions", "True"]).mask_truncated_completions is True)
-    and (m.parse_args([]).mask_truncated_completions is not True))
+# Partial credit: 12 of 16 is 0.75, under the 0.9 floor.
+mon, model, args, out = make(stop_n=12, total=16, steps=5)
+step(mon, model, args, 5)
+chk("0.75 does not clear a 0.9 floor", mon.armed is False)
+chk("the fraction is recorded as measured", abs(mon.probes[0][1] - 0.75) < 1e-6)
 
-# The marker files are the whole diagnostic surface.
-mon, tr, out = drive(m.MASK_AUTO, [0.05, 0.02, 0.9])
-chk("writes a collapse marker", os.path.exists(os.path.join(out, "grpo_termination_collapse.json")))
-chk("writes a trace on every run", os.path.exists(os.path.join(out, "grpo_termination_trace.json")))
-d = json.load(open(os.path.join(out, "grpo_termination_trace.json")))
-chk("the trace records the step it engaged", d["masking_engaged_at_step"] == 3)
-chk("the trace records the mode", d["mode"] == m.MASK_AUTO)
-mon, tr, out = drive(m.MASK_AUTO, [1.0, 1.0])
-d = json.load(open(os.path.join(out, "grpo_termination_trace.json")))
-chk("a clean run says so", d["collapsed"] is False and d["armed"] is False)
+# --no-termination-halt: report, do not act.
+mon, model, args, out = make(steps=5, halt=False)
+step(mon, model, args, 5)
+model.stop_n = 0
+ctl = step(mon, model, args, 10)
+chk("halt=False still detects", mon.collapsed is True)
+chk("halt=False does not stop training", ctl.should_training_stop is False)
 
-# An unbound monitor must not throw -- a wiring bug should be a loud log line and a
-# finished run, not a crash six hours in.
-mon, tr, out = drive(m.MASK_AUTO, [0.05, 0.02, 0.9], bind=False)
-chk("unbound monitor does not crash", mon.engaged is True)
+# A probe that throws must never reach the training loop, and must give up rather
+# than throw once a step for the rest of the run.
+mon, model, args, out = make(steps=5, raises=True)
+ctl = step(mon, model, args, 5)
+chk("a raising probe does not propagate", mon.failures == 1 and mon.disabled is False)
+ctl = step(mon, model, args, 10)
+chk("two failures disable the probe", mon.disabled is True)
+before = model.calls
+step(mon, model, args, 15)
+chk("a disabled probe stops generating", model.calls == before)
+chk("a disabled probe does not halt training", ctl.should_training_stop is False)
 
-# The metric key is TRL's, and a rename must surface rather than silently disable
-# the monitor. Reading a log with no such key must leave everything untouched.
-mon = Monitor(m.MASK_AUTO, 0.9)
-mon.bind(FakeTrainer())
-st = FakeState(); st.global_step = 1
-mon.on_log(types.SimpleNamespace(output_dir=tempfile.mkdtemp()), st,
-           types.SimpleNamespace(), logs={"loss": 0.2})
-chk("a log without the key is inert", mon.trace == [] and mon.missing_warned is True)
+# probe_steps=0 is the off switch.
+mon, model, args, out = make(steps=0)
+step(mon, model, args, 5)
+chk("--termination-probe-steps 0 disables", model.calls == 0)
+
+# The sampled statistic: watched, reported once, never acted on. This is the
+# 91038_g7 / 91036_g6 defect, which both cells diagnosed by hand at ~0.40.
+mon, model, args, out = make(steps=5)
+st = types.SimpleNamespace(global_step=1)
+ctl = types.SimpleNamespace(should_save=False, should_training_stop=False)
+mon.on_log(args, st, ctl, logs={"completions/clipped_ratio": 0.40})
+mon.on_log(args, st, ctl, logs={"completions/clipped_ratio": 0.42})
+chk("truncation is recorded every step", len(mon.clipped) == 2)
+chk("but warned about once", mon.truncation_warned is True)
+chk("truncation never halts", ctl.should_training_stop is False)
+mon2, _, args2, _ = make(steps=5)
+mon2.on_log(args2, st, ctl, logs={"completions/clipped_ratio": 0.05})
+chk("a healthy truncation rate is not warned about", mon2.truncation_warned is False)
+mon2.on_log(args2, st, ctl, logs={"loss": 0.3})
+chk("a log without the key is inert", len(mon2.clipped) == 1 and mon2.missing_warned)
 chk("the key TRL 0.27.2 emits is the one watched",
     "completions/clipped_ratio" in Monitor.CLIPPED_KEYS)
+
+# The trace is written on every run, collapse or not.
+mon, model, args, out = make(steps=5)
+step(mon, model, args, 5)
+mon.on_train_end(args, types.SimpleNamespace(global_step=5),
+                 types.SimpleNamespace())
+p = os.path.join(out, "grpo_termination_trace.json")
+chk("a trace is written on a clean run", os.path.exists(p))
+d = json.load(open(p))
+chk("the trace says it was clean", d["collapsed"] is False and d["armed"] is True)
+chk("the trace carries the greedy series", len(d["greedy_probes"]) == 1)
+chk("the trace names the last good step", d["last_good_step"] == 5)
 
 sys.exit(1 if bad else 0)
 PYMON

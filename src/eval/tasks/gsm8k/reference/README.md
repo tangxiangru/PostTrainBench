@@ -67,35 +67,52 @@ same thing as a run that helped.
    in your tokenizer the script stops at second zero, because a template/model mismatch is
    this same defect wearing a different hat.
 
-4. **RL training the stop token back off again.** Defect 3 is about a stop token the
-   model cannot *reach*, and it is fixed before step zero on the decode side. This is the
-   same defect from the other end: the model can stop, and GRPO unlearns it. Nothing in
-   the objective prices termination -- `make_reward_fn` is binary on `grade_completion`,
-   which grades the trailing number and never asks whether the rollout ended -- so a
-   rollout that runs into the 512-token cap with the right number in its tail earns the
-   full reward and the full gradient, and "keep talking until a correct number goes past"
-   is a policy this reward pays for. 91039_g7 ran the ladder cleanly, found `1e-6` and
-   `3e-6` moved rollout reward *down* (-0.0266, -0.0203) and `1e-5` moved it up +0.3313,
-   then found that at `1e-5` greedy `stop_fraction` hit 0.0 and `mean_greedy_tokens` the
-   full 1024. It wrote `grpo_greedy_termination_failure.json`, concluded "the learning
-   rates that move rollout reward are exactly the learning rates that destroy greedy
-   termination -- there is no rate in the ladder that does both", abandoned RL and shipped
-   its SFT plateau at 73.01. The fourteen cells that shipped GRPO at `1e-5` *without*
-   collapsing averaged 83.2. It was not wrong about anything it measured; it was missing
-   the flag that breaks the tie, and the flag is hard to reach for because both of its
-   settings are wrong half the time. `--mask-truncated-completions False` leaves the hole
-   open; `True` closes it and opens another, because a base model that cannot stop yet has
-   nearly every rollout truncated, so masking zeroes most of the batch and the run makes no
-   progress while every number in the log looks healthy. The default is therefore neither:
-   `auto` keeps masking off until termination has actually been reached and latches it on
-   if it is then lost, which answers both objections at once and is a **no-op on a run that
-   never learns to stop** -- exactly the runs the second objection is about. `TerminationMonitor`
-   reads TRL's own `completions/clipped_ratio` (`grpo_trainer.py:1782`, the fraction of
-   rollouts whose last token is neither eos nor pad), so it costs no extra generation, and
-   it writes `grpo_termination_trace.json` next to the checkpoints on every run --
-   "termination held all the way through" is worth as much as the alarm is. Reward,
-   dataset, curriculum and learning rate are all still untouched: the only thing this
-   refuses to do is let the loss keep paying for completions that never terminated.
+4. **A policy that stops when sampled and never stops when decoded greedily.** Defect 3
+   is a stop token the model cannot *reach*, and it is fixed before step zero. This is the
+   same token going missing again for a completely different reason, and the reason is a
+   train/serve skew rather than a bug in either half: GRPO optimises a reward computed on
+   **sampled** rollouts capped at `--max-completion-length` (512), and the grade is
+   computed on a **greedy** decode capped at 4000. Nothing in the training loop ever
+   performs the second one. A rollout sampled at temperature 1.0 wanders into the stop
+   token eventually; a greedy decode of that same policy can loop forever.
+
+   91039_g7 is the worked example, and the obvious reading of it is wrong. Its telemetry
+   endorsed the checkpoint it picked: reward 0.231 → 0.562, `completions/clipped_ratio`
+   **max 0.086**, mean completion length 185 of a 512 cap, and in its own words "no kill
+   criterion fired through step 30". Sampled rollouts terminated. The graded read of that
+   checkpoint then produced completions averaging **13,425 characters**, ran into the
+   grader's 4000-token cap, and scored **19.41%** on the 170 rows it got through before
+   being killed — "scored on whatever number happens to be last in a page of unrelated
+   text". It concluded "there is no rate in the ladder that does both", abandoned RL and
+   shipped its SFT plateau at 73.01. The fourteen cells that shipped GRPO at `1e-5`
+   without this happening averaged 83.2. **No sampled statistic would have caught it**,
+   which is why `TerminationMonitor` generates instead of reading a metric: every
+   `--termination-probe-steps` steps (25) it greedy-decodes `--termination-probe-prompts`
+   (16) real training prompts for `--termination-probe-tokens` (1024) and reports the
+   fraction reaching the stop token. A probe that passes marks the checkpoint worth
+   keeping — `save_steps` defaults to 50 and this collapse landed by step 30, so without
+   that the only artefact of a dead run is the model that died. A probe that fails *after
+   one has passed* saves and halts, because continuing is not neutral: the run that
+   produced the 19.41% read spent its remaining budget making the model worse while its
+   loss curve improved. A model that has never yet stopped is left alone —
+   `--no-termination-halt` turns the acting off and keeps the reporting. The probe runs on
+   every rank (a forward pass is a collective under ZeRO-3 and FSDP, so a rank-zero-only
+   probe is a hang, not a measurement) and it can never take the run down: two failures
+   disable it, loudly.
+
+   Separately, the monitor prints the rollout truncation rate and says something once it
+   passes 25%. It does not act on it. 91038_g7 and 91036_g6 — the other two cells in this
+   arm's ~69 tail — both ran at **~40%** and both worked it out by hand, 91038_g7 filing
+   it as "a defect in the training configuration … 40% of rollouts are truncated and
+   scored zero", having reasoned that a truncated completion rarely ends on its final
+   answer, so two rollouts in five contribute a zero that says nothing about the policy.
+   That is worth one line at the moment it becomes true.
+
+   `grpo_termination_trace.json` is written next to the checkpoints on every run, not just
+   on collapse: "termination held the whole way through" is what lets a cell rule this out
+   and go and look somewhere else. Reward, dataset, curriculum and learning rate are all
+   still untouched — this measures the quantity the score is computed from, which the
+   training loop otherwise never looks at.
 
 ## Which model it trains
 
