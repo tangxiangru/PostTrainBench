@@ -361,11 +361,26 @@ echo "seat_source=${PTB_SEAT_SOURCE} seat_draws=${PTB_SEAT_DRAWS} seat_confound=
 _TD="src/eval/tasks/${TASK}/test_data.json"
 if [ ! -s "${_TD}" ]; then
     echo "FATAL: ${_TD} is missing or empty in ${REPO_ROOT}" >&2
-    echo "       It is gitignored, so a fresh clone never has it. Copy it from a" >&2
-    echo "       working checkout or re-run tools/ptb_setup.py before submitting." >&2
+    echo "       It is gitignored, so a fresh clone never has it. Regenerate it from" >&2
+    echo "       the source the benchmark itself uses, which takes about ten seconds:" >&2
+    echo "         python3 src/judges/test_data_download/download_test_data.py --tasks ${TASK}" >&2
+    # Not "copy it from a working checkout, or re-run tools/ptb_setup.py", which is what
+    # this said until 90965 hit it: ptb_setup.py installs arms and has never written a
+    # test_data.json, and a copy is only as trustworthy as the checkout it came from. The
+    # downloader is deterministic -- the file it wrote for gsm8k on 2026-09-03 hashed
+    # identically to the copy the 12v12 board had already run against -- so regenerating
+    # is the answer that also proves the file is the right one.
     exit 1
 fi
-echo "test_data=${_TD} bytes=$(stat -c%s "${_TD}")"
+# Bytes and items both, because the failure this guard cannot see is a file that exists
+# and is short: `-s` passes on a two-item JSON array, and the contamination judge would
+# then screen the agent's corpus against two questions and find nothing.
+echo "test_data=${_TD} bytes=$(stat -c%s "${_TD}") items=$(python3 -c '
+import json, sys
+try:
+    print(len(json.load(open(sys.argv[1]))))
+except Exception as exc:
+    print(f"unreadable:{type(exc).__name__}")' "${_TD}")"
 
 SCRATCH="${POST_TRAIN_BENCH_TMP_ROOT:-/tmp}"
 mkdir -p "$SCRATCH" || { echo "FATAL: cannot create $SCRATCH on $(hostname)" >&2; exit 1; }
