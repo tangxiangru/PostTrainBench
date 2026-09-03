@@ -76,11 +76,93 @@ JOB_DIR="${TMP_SUBDIR}/job_dir"
 JOB_TMP="${TMP_SUBDIR}/tmp"
 export HF_MERGED="${TMP_SUBDIR}/merged_huggingface"
 
+# Where run-generated CPython bytecode goes. This is the same bug as the
+# HuggingFace/vLLM cache one documented above run_evaluation, one library over:
+# every exec here is --writable-tmpfs, so the container root is a fuse-overlayfs
+# capped at `sessiondir max size` (64 on this cluster, measured as 65536 1-KiB
+# blocks), and nothing in the images is precompiled -- uv installs with
+# --no-cache and does not byte-compile, leaving 24602 .py against 886 .pyc in
+# dist-packages. One `import transformers, torch, vllm` writes 41 MiB of .pyc,
+# measured; ENOSPC part-way through leaves a truncated .pyc and every later
+# import of that module dies, which is why the symptom is "vLLM will not start"
+# on a node with terabytes free. Eight of the twelve gsm8k cells in
+# 89727/89809/89810 lost time to it, ~1.5-2 h across the arm. The fix is the
+# same one that worked for the caches: name the variable, and point it at
+# something that is actually bound.
+#
+# Two directories because the two sandboxes have different mount tables and one
+# path cannot be right for both -- the trap is a single top-level export, which
+# reaches the scorer (no --cleanenv) and silently misses the agent (-c
+# --cleanenv), i.e. it fixes the half that runs for minutes and not the half
+# that runs for ten hours.
+#   JOB_PYCACHE    -- the agent and the judges, which bind JOB_TMP at /tmp, so
+#                     inside those sandboxes it is the literal /tmp/pycache.
+#   SCORER_PYCACHE -- the scorer, which binds neither JOB_TMP nor JOB_DIR, so it
+#                     gets its own identity-bound directory. Exported because
+#                     run_evaluation is re-run through `bash -c "$(declare -f
+#                     ...)"` and only exported scalars cross that boundary.
+# Both sit under TMP_SUBDIR, so they are node-local, they are counted by the
+# disk_tmp line in the solve diagnostics, and they die with the scratch dir.
+JOB_PYCACHE="${JOB_TMP}/pycache"
+export SCORER_PYCACHE="${TMP_SUBDIR}/pycache_scorer"
+
+# --- POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND -------------------------------
+# Unset by default. When set, its value is passed as VLLM_ATTENTION_BACKEND to
+# every exec below that can start a vLLM server -- the agent sandbox, the
+# judges, and the scorer -- and to the two ptb_ops rescore jobs.
+#
+# What it is for. Cell 89810_g5 lost 7 of its 43 grader invocations to a CUDA
+# illegal-memory-access inside vLLM's default attention kernel and only stopped
+# losing them after it set VLLM_ATTENTION_BACKEND=TRITON_ATTN by hand, mid-run.
+# That is a 16% invocation failure rate on one cell, each failure costing a full
+# ~7.2 min n=1319 read, and it is the kind of fault that looks like a harness
+# bug rather than a kernel choice.
+#
+# Why it is NOT pinned on. Nobody has measured what TRITON_ATTN costs at these
+# shapes (Qwen3-1.7B, batch-of-1319 greedy decode at 2-3k max tokens, and the
+# agent's own GRPO rollouts). If it is slower than the default -- and a triton
+# fallback usually is -- pinning it turns a rare crash on one cell into a
+# uniform throughput tax on every read and every rollout in the arm, which is
+# the more expensive of the two mistakes and the one that would not show up in
+# any log. Turning a crash into a tax without measuring the tax is not a fix.
+#
+# How to find out: run one cell with
+#   POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND=TRITON_ATTN
+# and compare its final_eval_*.txt wall clock against a sibling cell on the same
+# node at the same n. The measured baseline to compare against is 1.10 min fixed
+# + 0.0046 min/row, i.e. ~7.2 min at n=1319. If the delta is inside the noise,
+# pin it in .env; if it is not, this stays a per-cell escape hatch for the next
+# node that shows the illegal-memory-access.
+# ---------------------------------------------------------------------------
+
 mkdir -p "${JOB_DIR}"
 mkdir -p "${JOB_TMP}"
+mkdir -p "${JOB_PYCACHE}"
+mkdir -p "${SCORER_PYCACHE}"
 
-echo "Preparing job directory..." 
+echo "Preparing job directory..."
 mkdir -p "${JOB_DIR}"
+
+# --- where JOB_DIR appears INSIDE the agent sandbox ---------------------------
+# The agent exec below runs `--home "${JOB_DIR}:${SANDBOX_HOME}"` and
+# `--pwd "${SANDBOX_TASK_DIR}"`, so every file copied into "${JOB_DIR}/task" below is
+# reachable inside the container at "${SANDBOX_TASK_DIR}/<name>" and nowhere else.
+#
+# These are variables and not three more literal /home/ben strings because the prompt has
+# to name the same paths, and a prompt path that drifts from the bind is not a
+# compile error anywhere -- it is an agent that cannot find the file, with nothing in any
+# log. get_prompt.py is handed both values below, and
+# tests/test_graded_read.sh [14] asserts that its defaults still equal what the exec binds.
+#
+# Why absolute rather than relative. The control arm's agent starts with cwd
+# "${SANDBOX_TASK_DIR}", so "reference/train_grpo.py" resolves for it. The
+# claude_autor arm's operator runs each of its stages with cwd
+# "${SANDBOX_TASK_DIR}/.autor/<stamp>/" (autor src/manager.py, src/utils.py:533-534), two
+# levels deeper, where the same relative path resolves to nothing. A bare relative path in
+# the prompt therefore advertises a file that exists on one arm of the comparison and not
+# on the other -- silently, and on exactly the arm the scaffolding was built for.
+SANDBOX_HOME="/home/ben"
+SANDBOX_TASK_DIR="${SANDBOX_HOME}/task"
 
 mkdir "${JOB_DIR}/task"
 
@@ -93,10 +175,40 @@ cp -r src/eval/templates "${JOB_DIR}/task/"
 if [ -d "src/eval/tasks/${EVALUATION_TASK}/task_context" ]; then
     cp -r src/eval/tasks/${EVALUATION_TASK}/task_context/* "${JOB_DIR}/task"
 fi
+
+# Two more names on the same whitelist. The agent exec below has no repo bind at all --
+# -c --cleanenv, --home "${JOB_DIR}:/home/ben" -- so a file is inside /home/ben/task
+# because it was copied here or it is not there at all, and the copies above glob nothing.
+#   reference/     per-task and gsm8k-only today, so it keeps the -d guard the two blocks
+#                  above use. Copied as the DIRECTORY, not its contents: get_prompt.py's
+#                  {reference_script} bullet names reference/train_grpo.py, reference/
+#                  README.md and reference/smoke.sh, and flattening would break all three.
+#   graded_read.py unconditional, because it wraps whatever evaluate.py the task shipped
+#                  and refuses rather than guesses where it cannot verify a read. See
+#                  src/utils/graded_read.py for the two near-miss silent wrong answers in
+#                  the 89727/89809/89810 arm that it exists to make unwriteable; the short
+#                  version is that an unchecked exit code turned one cell's n=500 read of
+#                  the wrong checkpoint into a file named *_1319_*, and rendered another
+#                  cell's ENOENT as a ship verdict.
+if [ -d "src/eval/tasks/${EVALUATION_TASK}/reference" ]; then
+    cp -r "src/eval/tasks/${EVALUATION_TASK}/reference" "${JOB_DIR}/task"
+fi
+cp src/utils/graded_read.py "${JOB_DIR}/task/graded_read.py"
+
+# Nothing that arrived above may carry CPython bytecode. `cp -r` copies __pycache__ along
+# with the sources, and a checkout on this login node is python 3.13 while the container is
+# 3.10: a stale 3.13 .pyc beside a .py is at best dead weight on the 64 MiB --writable-tmpfs
+# overlay this whole file spends effort keeping clear (see JOB_PYCACHE above), and a
+# magic-number mismatch is the kind of import error that reads as "the reference script is
+# broken". One `find` covers every copy above, including the ones added later that forget
+# about this, which is why it is here and not inside the `reference/` branch.
+find "${JOB_DIR}/task" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null
+find "${JOB_DIR}/task" \( -name '*.pyc' -o -name '*.pyo' \) -type f -delete 2>/dev/null
+
 cp -r "containers/other_home_data/.codex" "${JOB_DIR}/"
 
 BENCHMARK=$(cat src/eval/tasks/${EVALUATION_TASK}/benchmark.txt)
-PROMPT=$(python src/eval/general/get_prompt.py --model-to-train "$MODEL_TO_TRAIN" --benchmark-id "$EVALUATION_TASK" --num-hours "$NUM_HOURS" --num-gpus "$NUM_GPUS" --agent "${AGENT}")
+PROMPT=$(python src/eval/general/get_prompt.py --model-to-train "$MODEL_TO_TRAIN" --benchmark-id "$EVALUATION_TASK" --num-hours "$NUM_HOURS" --num-gpus "$NUM_GPUS" --agent "${AGENT}" --sandbox-home-dir "${SANDBOX_HOME}" --sandbox-task-dir "${SANDBOX_TASK_DIR}")
 echo "$PROMPT" > "${EVAL_DIR}/prompt.txt"
 
 bash src/utils/create_timer.sh $NUM_HOURS $JOB_DIR/task/timer.sh
@@ -147,6 +259,10 @@ echo "API keys provisioned for agent=${AGENT} task=${EVALUATION_TASK}: ${ALLOWED
 # Copy scripts needed inside the container
 cp src/utils/check_cuda.py "${JOB_DIR}/check_cuda.py"
 cp src/utils/check_cuda_writing.py "${JOB_DIR}/check_cuda_writing.py"
+# Third startup assertion, alongside the two CUDA ones and for the same reason:
+# it costs a second at t=0 and the thing it catches otherwise surfaces hours in
+# as an unrelated-looking import error. See src/utils/check_pycache.sh.
+cp src/utils/check_pycache.sh "${JOB_DIR}/check_pycache.sh"
 cp src/utils/system_monitor.sh "${JOB_DIR}/system_monitor.sh"
 cp src/utils/timestamp_lines.py "${JOB_DIR}/timestamp_lines.py"
 cp src/utils/update_agent_cli.sh "${JOB_DIR}/update_agent_cli.sh"
@@ -487,15 +603,30 @@ solve_task() {
         export NVIDIA_VISIBLE_DEVICES="${POST_TRAIN_BENCH_VISIBLE_GPUS}"
         NVCCLI_ARGS=(--nvccli)
     fi
-    # The three facts a payload agent's entry point needs and cannot otherwise
+    # Opt-in only; the whole argument is at POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND
+    # near the top of this file. Empty array when unset, so an exec built without
+    # the variable is byte-for-byte the one that ran before this existed.
+    ATTN_BACKEND_ENV=()
+    [ -n "${POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND:-}" ] && \
+        ATTN_BACKEND_ENV=(--env "VLLM_ATTENTION_BACKEND=${POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND}")
+    # Two of the three facts a payload agent's entry point needs and cannot otherwise
     # get: --cleanenv drops them, and the only copies inside the sandbox are
     # prose inside $PROMPT and a countdown in timer.sh. Same guard as the copy
     # above, so an agent without a payload sees exactly the environment it saw
     # before this block existed.
+    #
+    # MODEL_TO_TRAIN used to be the third and is now unconditional, below. It moved out
+    # because it stopped being an agent-entry-point fact: reference/train_grpo.py is copied
+    # into EVERY gsm8k cell on every arm and reads it to decide which of the four swept base
+    # models it is training. Left under this guard it would be present on the payload arm
+    # and absent on the control -- the reference script would then hard-refuse on the
+    # control arm only, which is a difference between the arms introduced by the
+    # scaffolding rather than by the thing under test. Unconditional makes the two arms
+    # agree on this variable; BENCHMARK_ID and NUM_HOURS stay guarded because nothing
+    # outside a payload entry point reads them.
     AGENT_CONTEXT_ENV=()
     [ -d "${JOB_DIR}/agent" ] && AGENT_CONTEXT_ENV=(
         --env "BENCHMARK_ID=${EVALUATION_TASK}"
-        --env "MODEL_TO_TRAIN=${MODEL_TO_TRAIN}"
         --env "NUM_HOURS=${NUM_HOURS}"
     )
     # SOLVE_EXIT below is meant to say whether the agent worked. It did not: the
@@ -507,6 +638,15 @@ solve_task() {
     # the one nobody reads first. pipefail plus an explicit exit makes the number
     # mean what its label says; nothing downstream branches on it, so an honest
     # nonzero costs nothing and a dishonest zero cost five cells.
+    #
+    # check_pycache.sh runs INSIDE this exec rather than as a preflight exec of
+    # its own, and that placement is the point. A separate exec would carry its
+    # own copy of --env PYTHONPYCACHEPREFIX and --bind "${JOB_TMP}:/tmp", the two
+    # copies could then disagree, and an assertion that can drift away from the
+    # thing it asserts is worth nothing -- drifting apart is the exact failure
+    # being guarded against. Run here it sees the one bind list that exists. It
+    # costs about a second, its output lands in solve_out.txt, and a broken bind
+    # list ends the cell in the first seconds rather than three hours in.
     timeout --signal=TERM --kill-after=30s "$((NUM_HOURS * 60 + 5))m" \
     apptainer exec \
         --nv \
@@ -520,23 +660,26 @@ solve_task() {
         "${API_KEY_ENV_ARGS[@]}" \
         --env VLLM_API_KEY="inspectai" \
         --env PYTHONNOUSERSITE="1" \
+        --env PYTHONPYCACHEPREFIX="/tmp/pycache" \
         --env NUM_GPUS="${NUM_GPUS}" \
+        --env MODEL_TO_TRAIN="${MODEL_TO_TRAIN}" \
         --env PROMPT="${PROMPT}" \
         --env AGENT_CONFIG="${AGENT_CONFIG}" \
         "${CLI_UPDATE_ENV[@]}" \
         "${VISIBLE_GPUS_ENV[@]}" \
         "${AGENT_CONTEXT_ENV[@]}" \
         "${AGENT_ENV_ARGS[@]}" \
+        "${ATTN_BACKEND_ENV[@]}" \
         --bind "${JOB_TMP}:/tmp" \
         --bind "${HF_MERGED}:${HF_HOME_NEW}" \
         "${AGENT_AUTH_BIND[@]}" \
         "${CURSOR_AUTH_BIND[@]}" \
         "${GROK_AUTH_BIND[@]}" \
-        --home "${JOB_DIR}:/home/ben" \
-        --pwd "/home/ben/task" \
+        --home "${JOB_DIR}:${SANDBOX_HOME}" \
+        --pwd "${SANDBOX_TASK_DIR}" \
         --writable-tmpfs \
         "${POST_TRAIN_BENCH_CONTAINERS_DIR}/${POST_TRAIN_BENCH_CONTAINER_NAME}.sif" \
-        bash -c "set -o pipefail; { python /home/ben/check_cuda.py && python /home/ben/check_cuda_writing.py || exit 1; bash /home/ben/system_monitor.sh & MONITOR_PID=\$!; bash /home/ben/agent_solve.sh; SOLVE_RC=\$?; kill \$MONITOR_PID 2>/dev/null; exit \$SOLVE_RC; } 2>&1 | python /home/ben/timestamp_lines.py" > "${SOLVE_OUT}" 2>&1
+        bash -c "set -o pipefail; { bash /home/ben/check_pycache.sh && python /home/ben/check_cuda.py && python /home/ben/check_cuda_writing.py || exit 1; bash /home/ben/system_monitor.sh & MONITOR_PID=\$!; bash /home/ben/agent_solve.sh; SOLVE_RC=\$?; kill \$MONITOR_PID 2>/dev/null; exit \$SOLVE_RC; } 2>&1 | python /home/ben/timestamp_lines.py" > "${SOLVE_OUT}" 2>&1
 }
 
 # ---------- judge OAuth precheck ----------
@@ -698,12 +841,29 @@ prepare_judge_sandbox "${JOB_DIR}" "${EVALUATION_TASK}" "${EVAL_DIR}/final_model
 # the source instead of dying with the sandbox.
 setup_judge_codex_auth "${JOB_DIR}" || exit 1
 
+# PYTHONPYCACHEPREFIX belongs here and not only on the agent: the judge exec in
+# src/judges/judge_lib.sh is --containall --writable-tmpfs on the same 64 MiB
+# overlay, it runs four codex sessions plus contamination_check.py and
+# model_identity_check.py, and one of the judges npm-installs a pinned codex
+# (node-gyp shells out to python). /tmp/pycache resolves because that exec binds
+# the same "${JOB_TMP}:/tmp" the agent does -- passing it through this array is
+# what lets the judges be covered without editing judge_lib.sh.
+#
+# Unlike the agent and scorer execs, this one carries no check_pycache.sh
+# assertion: the assertion has to run inside the exec to be worth anything (see
+# the comment above the agent exec), that exec's command line is judge_lib.sh's,
+# and this change does not own that file. So the judges get the variable and not
+# the guarantee; if the /tmp bind there ever moves, the agent's assertion fires
+# first and names the same defect.
 JUDGE_EXTRA_APPTAINER_ARGS=(
     --nv
     --env HF_HOME="${HF_HOME_NEW}"
     --env VLLM_API_KEY="inspectai"
+    --env PYTHONPYCACHEPREFIX="/tmp/pycache"
     --bind "${HF_MERGED}:${HF_HOME_NEW}"
 )
+[ -n "${POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND:-}" ] && \
+    JUDGE_EXTRA_APPTAINER_ARGS+=(--env "VLLM_ATTENTION_BACKEND=${POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND}")
 
 FIRST_JUDGE=1
 for JUDGE_NAME in "${ALL_JUDGES[@]}"; do
@@ -757,7 +917,21 @@ export TMP_HF_CACHE="/tmp/hf_cache_90afd0"
 # variable, and keeps compiled triton kernels between the nine attempts.
 #
 # The agent sandbox needs neither: it launches with -c --cleanenv, so none of
-# these ever reached it, which is why only the scorer failed.
+# these ever reached it, which is why only the scorer failed. Two caveats worth
+# having in writing, because both have since bitten:
+#
+#   1. --cleanenv is only half of why the agent escapes. It leaves XDG_CACHE_HOME
+#      unset inside the sandbox, so every library without a variable of its own
+#      falls back to $HOME/.cache -- and $HOME is `--home "${JOB_DIR}:/home/ben"`,
+#      node-local scratch. Drop the home bind and keep --cleanenv and the agent
+#      fills the same 64 MiB overlay the scorer did.
+#   2. It generalises to caches, not to everything. CPython bytecode has no
+#      variable that defaults anywhere useful: absent PYTHONPYCACHEPREFIX a .pyc
+#      is written next to its .py, i.e. into read-only dist-packages inside the
+#      image, i.e. onto the --writable-tmpfs overlay, in BOTH sandboxes. So the
+#      bytecode fix (JOB_PYCACHE / SCORER_PYCACHE, defined at the top of this
+#      file) had to be applied to the agent as well, and had to be an --env on
+#      the exec rather than a host export, which -c --cleanenv would drop.
 #
 # Both lists are built inside run_evaluation rather than out here, for the reason
 # the comment above run_evaluation_with_retry's `declare -f` already gives once:
@@ -845,11 +1019,41 @@ run_evaluation() {
     local visible_gpus_env=()
     [ -n "${POST_TRAIN_BENCH_VISIBLE_GPUS:-}" ] && \
         visible_gpus_env+=(--env "CUDA_VISIBLE_DEVICES=${POST_TRAIN_BENCH_VISIBLE_GPUS}")
+    # Same reason the two lists above are locals: this array cannot be built at
+    # file scope, because bash cannot export an array through the `bash -c` in
+    # run_evaluation_with_retry and "${attn_backend_env[@]}" would arrive empty.
+    local attn_backend_env=()
+    [ -n "${POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND:-}" ] && \
+        attn_backend_env=(--env "VLLM_ATTENTION_BACKEND=${POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND}")
+    # SCORER_PYCACHE is bound at its own path rather than redirected into an
+    # existing bind, for the same reason XDG_CACHE_HOME is bound above. It cannot
+    # reuse the agent's /tmp/pycache: this exec binds neither JOB_TMP nor JOB_DIR,
+    # and it has no -c, so /tmp here is the host's boot disk -- the 200 GiB one
+    # POST_TRAIN_BENCH_TMP_ROOT exists to keep eight concurrent cells off. It
+    # must be the exported scalar and not ${JOB_TMP}: JOB_TMP is not exported, so
+    # inside this function it is empty and the pair would silently become
+    # --bind ":" and PYTHONPYCACHEPREFIX=/pycache, which is the container root,
+    # which is the unfixed behaviour with a variable set to make it look fixed.
+    #
+    # The --bind and the --env are adjacent on purpose: they are one fact, and
+    # check_pycache.sh below fails the attempt if they ever stop agreeing.
+    #
+    # That check runs as `bash -c '<check> || exit 1; exec python "$@"'` inside
+    # this same exec rather than as a preflight exec of its own, so it measures
+    # the bind list that is actually in force -- a second exec would carry a
+    # second copy of the bind and could not notice this one losing it. The
+    # wrapper is written with the arguments as positional parameters and the
+    # repo root as $0 so that ${max_tokens_arg}, which is deliberately unquoted
+    # and word-splits into zero or two arguments, keeps doing exactly that, and
+    # so that nothing inside the single-quoted script is expanded by the host
+    # shell. `exec` replaces the wrapper, so the timeout above and the exit code
+    # below still refer to python and not to a shell wrapping it.
     with_huggingface_overlay apptainer exec \
         --nv \
         "${visible_gpus_env[@]}" \
         "${hf_cache_env[@]}" \
         "${cache_bind[@]}" \
+        "${attn_backend_env[@]}" \
         --env OPENAI_API_KEY="${OPENAI_API_KEY}" \
         --env OPENROUTER_API_KEY="${OPENROUTER_API_KEY}" \
         --env VLLM_API_KEY="inspectai" \
@@ -858,8 +1062,12 @@ run_evaluation() {
         --bind "${EVAL_DIR}:${EVAL_DIR}" \
         --bind "${REPO_ROOT}:${REPO_ROOT}" \
         --bind "${HF_MERGED}:${TMP_HF_CACHE}" \
+        --bind "${SCORER_PYCACHE}:${SCORER_PYCACHE}" \
+        --env PYTHONPYCACHEPREFIX="${SCORER_PYCACHE}" \
         --pwd "$(pwd)/src/eval/tasks/${EVALUATION_TASK}" \
-        ${POST_TRAIN_BENCH_CONTAINERS_DIR}/vllm_debug.sif python "${EVAL_SCRIPT}" \
+        ${POST_TRAIN_BENCH_CONTAINERS_DIR}/vllm_debug.sif \
+        bash -c 'bash "$0/src/utils/check_pycache.sh" || exit 1; exec python "$@"' \
+            "${REPO_ROOT}" "${EVAL_SCRIPT}" \
             --model-path "$EVAL_DIR/final_model" \
             --templates-dir ../../../../src/eval/templates \
             --limit -1 \
