@@ -801,12 +801,69 @@ def build_dataset(args):
 # --------------------------------------------------------------------------------------
 
 
+class BooleanFlag(argparse.Action):
+    """`--bf16`, `--no-bf16` and `--bf16 false` all mean what they look like.
+
+    argparse.BooleanOptionalAction accepts only the first two. HuggingFace's own
+    TrainingArguments accepts `--bf16 True`, and that is the spelling an agent
+    writing a TRL command has read a hundred times, so it is the one it actually
+    types. Measured on the live 2026-09-03 campaign: cell 295f00fb burned two
+    probe launches on
+
+        train_grpo.py: error: unrecognized arguments: false
+
+    before logging "Fix flag and relaunch probes". A reference script advertised
+    to the agent as pre-validated should not charge it for the ecosystem's
+    spelling of a boolean.
+
+    Safe as nargs="?" only because this parser has no positional arguments -- if
+    one is ever added, `--bf16 <positional>` would swallow it.
+    """
+
+    TRUE = frozenset({"true", "t", "yes", "y", "1", "on"})
+    FALSE = frozenset({"false", "f", "no", "n", "0", "off"})
+
+    def __init__(self, option_strings, dest, default=None, help=None, **kwargs):
+        opts = []
+        for opt in option_strings:
+            opts.append(opt)
+            if opt.startswith("--") and not opt.startswith("--no-"):
+                opts.append("--no-" + opt[2:])
+        super().__init__(option_strings=opts, dest=dest, nargs="?", default=default,
+                         help=help, metavar="BOOL", **kwargs)
+
+    def __call__(self, parser, namespace, value, option_string=None):
+        negated = (option_string or "").startswith("--no-")
+        if value is None:
+            # The bare flag: `--bf16` is True, `--no-bf16` is False.
+            parsed = not negated
+        else:
+            low = str(value).strip().lower()
+            if low in self.TRUE:
+                parsed = True
+            elif low in self.FALSE:
+                parsed = False
+            else:
+                raise argparse.ArgumentError(self, (
+                    f"expected a boolean, got {value!r}. Accepted: "
+                    f"{'/'.join(sorted(self.TRUE))} or {'/'.join(sorted(self.FALSE))}, "
+                    "or pass the flag bare."
+                ))
+            # `--no-bf16 false` reads as "no-bf16 is false", i.e. bf16 is on.
+            if negated:
+                parsed = not parsed
+        setattr(namespace, self.dest, parsed)
+
+    def format_usage(self):
+        return " | ".join(self.option_strings)
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    b = argparse.BooleanOptionalAction
+    b = BooleanFlag
 
     g = p.add_argument_group("model and data")
     # No defaults on these three. `None` means "resolve it", `''` means "deliberately
