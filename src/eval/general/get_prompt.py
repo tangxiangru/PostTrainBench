@@ -6,15 +6,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-INSPECT_EVALS = [
-    "aime2025",
-    "bfcl",
-    "gpqamain",
-    "gsm8k",
-    "humaneval",
-    "humanevalplus",
-]
-
 #: Where run_task.sh's `--home`/`--pwd` put the job directory inside the agent sandbox.
 #: Defaults only: run_task.sh passes its own SANDBOX_HOME / SANDBOX_TASK_DIR on the command
 #: line, and tests/test_graded_read.sh [14] asserts these two constants still equal the
@@ -41,6 +32,23 @@ def task_evaluate_script(benchmark_id: str) -> Path:
     """
     script = os.environ.get("EVAL_SCRIPT", "evaluate.py") or "evaluate.py"
     return Path("src/eval/tasks") / benchmark_id / script
+
+def uses_inspect(benchmark_id: str) -> bool:
+    """Does this benchmark's grading run under inspect-ai?
+
+    Decides one bullet in the prompt ("ERROR warnings are normal, they come from
+    inspect-ai"). This used to be a hand-kept INSPECT_EVALS list, and it had drifted
+    both ways: it named "humanevalplus", which is not a task in this repo, and omitted
+    "aime2026", which is one and does use inspect -- so the single task added since the
+    list was written is the single task that silently lost the bullet. A list that must
+    be edited whenever a task is added will drift again and nothing will fail when it
+    does. Reading the file cannot drift.
+
+    Via task_evaluate_script() rather than a literal "evaluate.py", because run_task.sh
+    grades some runs with evaluate_openrouter.py and the answer is not the same file.
+    """
+    return evaluate_uses_inspect(task_evaluate_script(benchmark_id))
+
 
 def read_benchmark_name(benchmark_id: str) -> str:
     """Resolve the human-readable benchmark name from the benchmark_id."""
@@ -123,7 +131,7 @@ def main():
     result = result.replace('{sandbox_task_dir}', task)
     result = result.replace('{sandbox_home_dir}', home)
 
-    if args.benchmark_id in INSPECT_EVALS:
+    if uses_inspect(args.benchmark_id):
         result = result.replace('{setup_other}', "- A final note: the evaluate.py script sometimes outputs ERROR warnings. Do not be alarmed by this, this is normal behavior for inspect-ai. Also if you run into issues with the evaluate.py script, this is likely due to memory constraints on the GPU. In this case please decrease --max-connections or --max-tokens.\n")
     else:
         result = result.replace('{setup_other}', "")
