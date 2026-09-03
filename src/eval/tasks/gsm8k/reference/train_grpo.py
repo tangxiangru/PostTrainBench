@@ -719,6 +719,182 @@ def _make_guard_class():
     return GenerationConfigGuard
 
 
+def _make_termination_monitor_class():
+    """Build :class:`TerminationMonitor`, importing transformers only when called.
+
+    Deferred for the same reason as :func:`_make_guard_class`.
+    """
+    from transformers import TrainerCallback
+
+    class TerminationMonitor(TrainerCallback):
+        """Watch greedy termination, and stop GRPO from training it away.
+
+        This is README defect 3 wearing its third hat. The first two are about a
+        stop token the model cannot *reach*: the template closes an assistant turn
+        with a token the base model never emits, generation runs to the cap, and the
+        last-number scorer grades the tail. Both are fixed before step zero, on the
+        decode side, by :func:`derive_stop_token` and :func:`ensure_stop_tokens`.
+
+        The third hat is that RL can take a working stop token back, and nothing on
+        the decode side can see it happen. :func:`make_reward_fn` is binary on
+        :func:`grade_completion`, that grades the trailing number, and neither asks
+        whether the rollout ended -- so a rollout that hits the 512-token cap with
+        the right number somewhere in its tail earns the full reward and the full
+        gradient. "Never stop, keep talking until a correct number goes past" is a
+        policy this objective pays for.
+
+        Cell 91039_g7 of the 2026-09-03 campaign ran the ladder cleanly -- same SFT
+        parent, same seed, same data order, learning rate the only thing varying --
+        and found 1e-6 and 3e-6 both moved rollout reward *down* (-0.0266, -0.0203)
+        while 1e-5 moved it up +0.3313. It shipped from none of them: at 1e-5 greedy
+        stop_fraction reached 0.0 and mean_greedy_tokens the full 1024, so it wrote
+        grpo_greedy_termination_failure.json, concluded "the learning rates that move
+        rollout reward are exactly the learning rates that destroy greedy termination
+        -- there is no rate in the ladder that does both", abandoned RL and shipped
+        its SFT plateau at 73.01. The fourteen cells that shipped GRPO at 1e-5
+        without collapsing averaged 83.2. It was not wrong about what it measured. It
+        was missing the flag that breaks the tie, and the flag is hard to reach for
+        because both of its settings are wrong half the time.
+
+        So this resolves them by timing rather than by shaping. Masking stays off
+        until termination has actually been achieved, and latches on if it is then
+        lost. A model that never learns to stop is never masked, which makes ``auto``
+        a no-op on exactly the runs the "masking zeroes the batch" objection is
+        about. Reward, dataset, curriculum and learning rate are untouched, so this
+        stays a baseline rather than a recipe: the only thing it refuses to do is let
+        the loss keep paying for completions that never terminated.
+        """
+
+        # TRL 0.27.2 computes this at grpo_trainer.py:1782 as the fraction of rollouts
+        # whose last token is neither eos nor pad, gathers it across processes (:1783),
+        # appends it to _metrics (:1784), and its log() merges _metrics into the dict
+        # handed to on_log. main() has already pointed tokenizer.eos_token at the
+        # template's closing token, so this counts exactly the rollouts that failed to
+        # emit the token the grader stops on. There is nothing to generate and nothing
+        # to measure ourselves; the signal is already in the log line.
+        CLIPPED_KEYS = ("completions/clipped_ratio", "clipped_ratio")
+
+        def __init__(self, mode, floor: float):
+            self.mode = mode
+            self.floor = floor
+            self.trainer = None
+            self.armed = False       # termination was reached at least once
+            self.engaged = False     # collapse seen; masking latched on
+            self.engaged_step = None
+            self.best = 0.0
+            self.last = None
+            self.trace = []
+            self.missing_warned = False
+
+        def bind(self, trainer) -> None:
+            """Give the callback the trainer whose flag it flips.
+
+            TRL reads ``self.mask_truncated_completions`` off the *trainer*
+            (grpo_trainer.py:1868), having copied it out of the config once in
+            ``__init__`` (:492). Setting it on ``trainer.args`` after construction
+            therefore does nothing whatsoever, and a callback is only ever handed
+            ``args`` -- the TrainingArguments -- so the handle has to arrive here.
+            """
+            self.trainer = trainer
+
+        def _ratio(self, logs):
+            for key in self.CLIPPED_KEYS:
+                value = (logs or {}).get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return float(value)
+            return None
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            ratio = self._ratio(logs)
+            if ratio is None:
+                if not self.missing_warned:
+                    self.missing_warned = True
+                    logger.warning(
+                        "termination monitor: no %s in the trainer's logs (saw %s). "
+                        "Termination is unwatched for this run.",
+                        " or ".join(self.CLIPPED_KEYS), sorted(logs or {}),
+                    )
+                return
+            terminated = 1.0 - ratio
+            self.last = terminated
+            self.best = max(self.best, terminated)
+            self.trace.append((int(state.global_step), round(terminated, 4)))
+
+            if terminated >= self.floor:
+                if not self.armed:
+                    self.armed = True
+                    logger.info(
+                        "termination monitor: armed at step %d (%.1f%% of rollouts end "
+                        "on the stop token)", state.global_step, 100.0 * terminated,
+                    )
+                return
+            if not self.armed or self.engaged:
+                # Not armed: this model has never stopped reliably, so a low number is
+                # a model still learning rather than a model unlearning, and nothing
+                # happens. That is the whole of the "masking zeroes the batch" case.
+                return
+
+            self.engaged = True
+            self.engaged_step = int(state.global_step)
+            logger.error(
+                "termination collapse at step %d: %.1f%% of rollouts end on the stop "
+                "token, best was %.1f%%, floor %.1f%%. The reward does not price this "
+                "-- grade_completion() grades the trailing number of a rollout that "
+                "never finished -- so training reward can keep climbing while the model "
+                "you ship can no longer stop.",
+                self.engaged_step, 100.0 * terminated, 100.0 * self.best,
+                100.0 * self.floor,
+            )
+            if self.mode == MASK_AUTO:
+                if self.trainer is None:
+                    logger.error(
+                        "termination monitor: no trainer bound, cannot enable masking. "
+                        "That is a wiring bug in main(); see TerminationMonitor.bind."
+                    )
+                else:
+                    self.trainer.mask_truncated_completions = True
+                    logger.error(
+                        "--mask-truncated-completions=%s: masking is ON from step %d. "
+                        "Truncated rollouts stop contributing to the loss.",
+                        MASK_AUTO, self.engaged_step,
+                    )
+            else:
+                logger.error(
+                    "--mask-truncated-completions=%s: leaving the loss alone. Pass %s "
+                    "to have this handled when it happens.", self.mode, MASK_AUTO,
+                )
+            self._write(args, "grpo_termination_collapse.json")
+
+        def on_train_end(self, args, state, control, **kwargs):
+            # Written whether or not anything went wrong. "Termination held all the way
+            # through" is the sentence a cell needs to rule this out and go looking
+            # somewhere else, and it is worth as much as the alarm is.
+            self._write(args, "grpo_termination_trace.json")
+
+        def _write(self, args, name) -> None:
+            path = os.path.join(args.output_dir, name)
+            payload = {
+                "mode": self.mode,
+                "floor": self.floor,
+                "armed": self.armed,
+                "collapsed": self.engaged,
+                "masking_engaged_at_step": self.engaged_step,
+                "best_terminated_fraction": round(self.best, 4),
+                "last_terminated_fraction":
+                    None if self.last is None else round(self.last, 4),
+                "trace": self.trace,
+            }
+            try:
+                os.makedirs(args.output_dir, exist_ok=True)
+                with open(path, "w") as f:
+                    json.dump(payload, f, indent=2)
+                logger.info("wrote %s", path)
+            except OSError as exc:
+                logger.error("cannot write %s (%s)", path, exc)
+
+    return TerminationMonitor
+
+
 # --------------------------------------------------------------------------------------
 # Dataset
 # --------------------------------------------------------------------------------------
@@ -858,6 +1034,39 @@ class BooleanFlag(argparse.Action):
         return " | ".join(self.option_strings)
 
 
+MASK_AUTO = "auto"
+
+
+class MaskModeFlag(BooleanFlag):
+    """`--mask-truncated-completions` is a boolean that also accepts ``auto``.
+
+    ``auto`` is neither "on" nor "off": it is off until the model has demonstrated
+    that it can stop, and on from the moment it stops being able to. The two
+    booleans are each wrong half the time -- see the flag's help text -- and a
+    third value is the only way to have both without shaping the reward.
+
+    Subclassed rather than replaced with ``type=`` so the bare flag and the
+    ``--no-`` spelling keep working; :class:`BooleanFlag` explains why that costs
+    a campaign two probe launches when it does not.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.metavar = "BOOL|auto"
+
+    def __call__(self, parser, namespace, value, option_string=None):
+        if value is not None and str(value).strip().lower() == MASK_AUTO:
+            if (option_string or "").startswith("--no-"):
+                raise argparse.ArgumentError(self, (
+                    f"{option_string} {MASK_AUTO} has no meaning. Pass "
+                    f"--{self.dest.replace('_', '-')} {MASK_AUTO} to arm it, or "
+                    f"{option_string} on its own to turn masking off outright."
+                ))
+            setattr(namespace, self.dest, MASK_AUTO)
+            return
+        super().__call__(parser, namespace, value, option_string)
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -910,13 +1119,23 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--top-k", type=int, default=0, help="rollout top_k; 0 disables")
     g.add_argument("--num-iterations", type=int, default=1, help="mu in the GRPO paper")
     g.add_argument("--epsilon", type=float, default=0.2, help="PPO-style clip range")
-    # TRL's default, and worth leaving alone until the model can stop. Early in training a
-    # base model almost never emits the stop token, so nearly every rollout is truncated;
-    # masking them then zeroes most of the batch and the run makes no progress while
-    # looking perfectly healthy in the logs. Grading the tail is also what the frozen
-    # scorer does, just at 4000 tokens instead of 512.
-    g.add_argument("--mask-truncated-completions", action=b, default=False,
-                   help="drop rollouts that hit the completion cap instead of scoring their tail")
+    # Both booleans are wrong half the time, so the default is neither of them.
+    # FALSE (TRL's default) leaves a hole: the reward is binary on
+    # grade_completion(), which grades the trailing number and never asks whether
+    # the rollout ended, so a completion that runs into the cap with the right
+    # number in its tail collects full reward and full gradient. TRUE closes it and
+    # opens another: early in training a base model almost never emits the stop
+    # token, so nearly every rollout is truncated, masking zeroes most of the batch,
+    # and the run makes no progress while looking perfectly healthy in the logs.
+    # AUTO is off until termination is reached and on if it is then lost, which is
+    # the only reading under which both objections are answered at once. It is a
+    # no-op on a run that never learns to stop -- see TerminationMonitor.
+    g.add_argument("--mask-truncated-completions", action=MaskModeFlag, default=MASK_AUTO,
+                   help="drop rollouts that hit the completion cap instead of scoring "
+                        "their tail; 'auto' does it only after termination collapses")
+    g.add_argument("--termination-floor", type=float, default=0.90,
+                   help="fraction of rollouts that must end on the stop token; falling "
+                        "below this after once clearing it is what 'auto' reacts to")
     g.add_argument("--reward-match", default="grader", choices=["grader", "strict"],
                    help="'strict' compares the extracted number with == instead of endswith")
     g.add_argument("--num-train-epochs", type=float, default=DEFAULT_NUM_TRAIN_EPOCHS)
@@ -1045,6 +1264,12 @@ def main(argv=None) -> int:
 
     generation_kwargs = build_generation_kwargs(args.use_vllm, stop_token_id)
 
+    # `auto` starts masking off and lets TerminationMonitor latch it on; only an
+    # explicit True starts it on. `is True` rather than truthiness because the
+    # string "auto" is truthy and would silently mean the opposite of itself.
+    mask_mode = args.mask_truncated_completions
+    mask_at_start = mask_mode is True
+
     config = GRPOConfig(
         output_dir=args.output_dir,
         learning_rate=args.learning_rate,
@@ -1063,7 +1288,7 @@ def main(argv=None) -> int:
         top_k=args.top_k,
         num_iterations=args.num_iterations,
         epsilon=args.epsilon,
-        mask_truncated_completions=args.mask_truncated_completions,
+        mask_truncated_completions=mask_at_start,
         num_train_epochs=args.num_train_epochs,
         max_steps=args.max_steps,
         seed=args.seed,
@@ -1083,7 +1308,9 @@ def main(argv=None) -> int:
         report_to=args.report_to,
     )
 
-    callbacks = []
+    monitor = _make_termination_monitor_class()(mask_mode, args.termination_floor)
+
+    callbacks = [monitor]
     if args.sanitise_generation_config or stop_token_id is not None:
         callbacks.append(
             _make_guard_class()(
@@ -1101,6 +1328,10 @@ def main(argv=None) -> int:
         reward_funcs=[make_reward_fn(strict=args.reward_match == "strict")],
         callbacks=callbacks,
     )
+    # After construction: TRL copies mask_truncated_completions out of the config in
+    # GRPOTrainer.__init__ and reads it off the trainer thereafter, so the monitor
+    # needs the trainer itself and there is no earlier moment it exists.
+    monitor.bind(trainer)
     trainer.train()
 
     final = os.path.join(args.output_dir, "final")
