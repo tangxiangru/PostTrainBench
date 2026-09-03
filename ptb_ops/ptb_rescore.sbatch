@@ -93,6 +93,9 @@ ATTN_BACKEND_ENV=()
 # second copy of the bind and could not notice this one losing it. $0 carries the
 # repo root and the rest are positional, so nothing in the single-quoted script
 # is expanded here and `exec` leaves python as the process whose rc is read.
+# Sourced (`.`) and not run: its remedy for a cache it cannot use is an export
+# (a relocated PYTHONPYCACHEPREFIX, or PYTHONDONTWRITEBYTECODE=1), and an export
+# from a child process reaches nothing. Sourcing also preserves "$@".
 apptainer exec \
     --nv \
     --env HF_HOME="${TMP_HF_CACHE}" \
@@ -109,7 +112,7 @@ apptainer exec \
     --env PYTHONPYCACHEPREFIX="${PYCACHE}" \
     --pwd "${REPO_ROOT}/src/eval/tasks/${TASK}" \
     "${POST_TRAIN_BENCH_CONTAINERS_DIR}/vllm_debug.sif" \
-    bash -c 'bash "$0/src/utils/check_pycache.sh" || exit 1; exec python "$@"' \
+    bash -c '. "$0/src/utils/check_pycache.sh" || exit 1; exec python "$@"' \
         "${REPO_ROOT}" evaluate.py \
         --model-path "${MODEL_PATH}" \
         --templates-dir ../../../../src/eval/templates \

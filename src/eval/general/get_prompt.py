@@ -106,6 +106,22 @@ def main():
     result = result.replace('{benchmark}', benchmark_name)
     result = result.replace('{num_hours}', args.num_hours)
     result = result.replace('{gpu_info}', gpu_info)
+    # The two paths the agent is told to USE, as opposed to the ones it is told about.
+    # They are absolute because the arms do not share a working directory: the control
+    # runs at the task root, where `bash timer.sh` resolves, and the AutoR operator runs
+    # its stages in ${task}/.autor/<stamp>/, where it does not. Measured on the live
+    # 2026-09-03 campaign: 4 of 20 AutoR cells hit `bash: timer.sh: No such file or
+    # directory` and none of the 7 control cells did, so the relative form was a tax
+    # only one arm paid -- small, but paid out of the arm being measured. Rule 6 was the
+    # worse half: read literally, `work only in the current directory` confines the
+    # AutoR operator to its own stage directory.
+    #
+    # final_model is named absolutely for a different reason -- not a measured fault but
+    # the most expensive possible one. All 176 historical runs and all 9 live cells put
+    # it at the task root, so nothing is being fixed here; it is spelled out because a
+    # checkpoint written one level down scores zero with no error anywhere.
+    result = result.replace('{sandbox_task_dir}', task)
+    result = result.replace('{sandbox_home_dir}', home)
 
     if args.benchmark_id in INSPECT_EVALS:
         result = result.replace('{setup_other}', "- A final note: the evaluate.py script sometimes outputs ERROR warnings. Do not be alarmed by this, this is normal behavior for inspect-ai. Also if you run into issues with the evaluate.py script, this is likely due to memory constraints on the GPU. In this case please decrease --max-connections or --max-tokens.\n")
