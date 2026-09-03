@@ -196,6 +196,9 @@ score_one() {
     # because ${REPO_ROOT} lives under the /rmeng_data/robtang bind below. $0 carries the
     # repo root and everything after it is positional, so nothing inside the single-quoted
     # script is expanded here, and `exec` leaves python as the process whose rc this reads.
+    # Sourced (`.`) and not run: its remedy for a cache it cannot use is an export (a
+    # relocated PYTHONPYCACHEPREFIX, or PYTHONDONTWRITEBYTECODE=1), and an export from a
+    # child process reaches nothing. Sourcing also preserves "$@".
     CUDA_VISIBLE_DEVICES="${gpu}" NUM_GPUS=1 apptainer exec \
         --nv \
         --env CUDA_VISIBLE_DEVICES="${gpu}" \
@@ -213,7 +216,7 @@ score_one() {
         --env PYTHONPYCACHEPREFIX="${pycache}" \
         --pwd "${REPO_ROOT}/src/eval/tasks/${TASK}" \
         "${POST_TRAIN_BENCH_CONTAINERS_DIR}/vllm_debug.sif" \
-        bash -c 'bash "$0/src/utils/check_pycache.sh" || exit 1; exec python "$@"' \
+        bash -c '. "$0/src/utils/check_pycache.sh" || exit 1; exec python "$@"' \
             "${REPO_ROOT}" evaluate.py \
             --model-path "${model}" \
             --templates-dir ../../../../src/eval/templates \

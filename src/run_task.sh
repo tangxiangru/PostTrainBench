@@ -95,16 +95,57 @@ export HF_MERGED="${TMP_SUBDIR}/merged_huggingface"
 # reaches the scorer (no --cleanenv) and silently misses the agent (-c
 # --cleanenv), i.e. it fixes the half that runs for minutes and not the half
 # that runs for ten hours.
-#   JOB_PYCACHE    -- the agent and the judges, which bind JOB_TMP at /tmp, so
-#                     inside those sandboxes it is the literal /tmp/pycache.
+#   JOB_PYCACHE    -- the agent and the judges, which bind JOB_TMP at SANDBOX_TMP,
+#                     so the same directory has TWO names and both are needed:
+#                     JOB_PYCACHE is the host one (what gets mkdir'd, du'd and
+#                     deleted), SANDBOX_PYCACHE is what the --env inside those
+#                     sandboxes has to say.
 #   SCORER_PYCACHE -- the scorer, which binds neither JOB_TMP nor JOB_DIR, so it
 #                     gets its own identity-bound directory. Exported because
 #                     run_evaluation is re-run through `bash -c "$(declare -f
 #                     ...)"` and only exported scalars cross that boundary.
 # Both sit under TMP_SUBDIR, so they are node-local, they are counted by the
 # disk_tmp line in the solve diagnostics, and they die with the scratch dir.
-JOB_PYCACHE="${JOB_TMP}/pycache"
+#
+# The two names for the one directory are derived from one basename and joined
+# by pycache_paths_agree below, because they were previously written out twice --
+# `JOB_PYCACHE="${JOB_TMP}/pycache"` here and a literal "/tmp/pycache" in each of
+# the two execs. Nothing tied the halves together: renaming the host side would
+# have left both execs pointing at a directory nobody creates, which is not an
+# error anywhere, just bytecode quietly going back onto the 64 MiB overlay.
+SANDBOX_TMP="/tmp"
+PYCACHE_BASENAME="pycache"
+JOB_PYCACHE="${JOB_TMP}/${PYCACHE_BASENAME}"
+SANDBOX_PYCACHE="${SANDBOX_TMP}/${PYCACHE_BASENAME}"
 export SCORER_PYCACHE="${TMP_SUBDIR}/pycache_scorer"
+
+# Translate the in-sandbox prefix back through the bind the execs declare
+# (--bind "${JOB_TMP}:${SANDBOX_TMP}") and require it to land on the host path
+# that actually gets created. The comparison is deliberately structural, so the
+# value of JOB_TMP cancels out: no node, no filesystem and no environment can
+# make this fail -- only an edit that moves one of the two names and not the
+# other, which is the exact drift this exists to catch, and which it then
+# reports in the first second of the job instead of as an import error hours in.
+pycache_paths_agree() {
+    local translated
+    case "${SANDBOX_PYCACHE}" in
+        "${SANDBOX_TMP}"/*) ;;
+        *)
+            echo "pycache_paths_agree: SANDBOX_PYCACHE=${SANDBOX_PYCACHE} is not under" >&2
+            echo "  SANDBOX_TMP=${SANDBOX_TMP}, so the agent/judge --bind cannot reach it." >&2
+            return 1 ;;
+    esac
+    translated="${JOB_TMP}/${SANDBOX_PYCACHE#"${SANDBOX_TMP}"/}"
+    if [ "${translated}" != "${JOB_PYCACHE}" ]; then
+        echo "pycache_paths_agree: the two names for the bytecode cache have drifted." >&2
+        echo "  in-sandbox PYTHONPYCACHEPREFIX ${SANDBOX_PYCACHE}" >&2
+        echo "  through --bind ${JOB_TMP}:${SANDBOX_TMP} that is ${translated}" >&2
+        echo "  but the directory this job creates is ${JOB_PYCACHE}" >&2
+        return 1
+    fi
+    return 0
+}
+pycache_paths_agree || exit 1
 
 # --- POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND -------------------------------
 # Unset by default. When set, its value is passed as VLLM_ATTENTION_BACKEND to
@@ -641,12 +682,22 @@ solve_task() {
     #
     # check_pycache.sh runs INSIDE this exec rather than as a preflight exec of
     # its own, and that placement is the point. A separate exec would carry its
-    # own copy of --env PYTHONPYCACHEPREFIX and --bind "${JOB_TMP}:/tmp", the two
-    # copies could then disagree, and an assertion that can drift away from the
-    # thing it asserts is worth nothing -- drifting apart is the exact failure
+    # own copy of --env PYTHONPYCACHEPREFIX and --bind "${JOB_TMP}:${SANDBOX_TMP}",
+    # the two copies could then disagree, and an assertion that can drift away from
+    # the thing it asserts is worth nothing -- drifting apart is the exact failure
     # being guarded against. Run here it sees the one bind list that exists. It
-    # costs about a second, its output lands in solve_out.txt, and a broken bind
-    # list ends the cell in the first seconds rather than three hours in.
+    # costs about a second and its output lands in solve_out.txt.
+    #
+    # It is SOURCED (`.`), not run as `bash`, and that is not a style choice. The
+    # script no longer kills the cell over a small filesystem -- 80 GPU-hours is
+    # worth more than the 1.5-2 h of imports it was protecting -- it repairs the
+    # environment instead, with `export PYTHONPYCACHEPREFIX=<somewhere that works>`
+    # or `export PYTHONDONTWRITEBYTECODE=1`. An export from a child process reaches
+    # nothing, so run as `bash` it would print a warning and change no behaviour at
+    # all. Sourced here it lands in the same subshell as agent_solve.sh, which is
+    # what the agent's ten hours of python inherits. It still returns nonzero, and
+    # this cell still ends in its first seconds, for the one fault that is not
+    # survivable: no writable scratch anywhere in the container.
     timeout --signal=TERM --kill-after=30s "$((NUM_HOURS * 60 + 5))m" \
     apptainer exec \
         --nv \
@@ -660,7 +711,7 @@ solve_task() {
         "${API_KEY_ENV_ARGS[@]}" \
         --env VLLM_API_KEY="inspectai" \
         --env PYTHONNOUSERSITE="1" \
-        --env PYTHONPYCACHEPREFIX="/tmp/pycache" \
+        --env PYTHONPYCACHEPREFIX="${SANDBOX_PYCACHE}" \
         --env NUM_GPUS="${NUM_GPUS}" \
         --env MODEL_TO_TRAIN="${MODEL_TO_TRAIN}" \
         --env PROMPT="${PROMPT}" \
@@ -670,7 +721,7 @@ solve_task() {
         "${AGENT_CONTEXT_ENV[@]}" \
         "${AGENT_ENV_ARGS[@]}" \
         "${ATTN_BACKEND_ENV[@]}" \
-        --bind "${JOB_TMP}:/tmp" \
+        --bind "${JOB_TMP}:${SANDBOX_TMP}" \
         --bind "${HF_MERGED}:${HF_HOME_NEW}" \
         "${AGENT_AUTH_BIND[@]}" \
         "${CURSOR_AUTH_BIND[@]}" \
@@ -679,7 +730,7 @@ solve_task() {
         --pwd "${SANDBOX_TASK_DIR}" \
         --writable-tmpfs \
         "${POST_TRAIN_BENCH_CONTAINERS_DIR}/${POST_TRAIN_BENCH_CONTAINER_NAME}.sif" \
-        bash -c "set -o pipefail; { bash /home/ben/check_pycache.sh && python /home/ben/check_cuda.py && python /home/ben/check_cuda_writing.py || exit 1; bash /home/ben/system_monitor.sh & MONITOR_PID=\$!; bash /home/ben/agent_solve.sh; SOLVE_RC=\$?; kill \$MONITOR_PID 2>/dev/null; exit \$SOLVE_RC; } 2>&1 | python /home/ben/timestamp_lines.py" > "${SOLVE_OUT}" 2>&1
+        bash -c "set -o pipefail; { . /home/ben/check_pycache.sh && python /home/ben/check_cuda.py && python /home/ben/check_cuda_writing.py || exit 1; bash /home/ben/system_monitor.sh & MONITOR_PID=\$!; bash /home/ben/agent_solve.sh; SOLVE_RC=\$?; kill \$MONITOR_PID 2>/dev/null; exit \$SOLVE_RC; } 2>&1 | python /home/ben/timestamp_lines.py" > "${SOLVE_OUT}" 2>&1
 }
 
 # ---------- judge OAuth precheck ----------
@@ -845,9 +896,13 @@ setup_judge_codex_auth "${JOB_DIR}" || exit 1
 # src/judges/judge_lib.sh is --containall --writable-tmpfs on the same 64 MiB
 # overlay, it runs four codex sessions plus contamination_check.py and
 # model_identity_check.py, and one of the judges npm-installs a pinned codex
-# (node-gyp shells out to python). /tmp/pycache resolves because that exec binds
-# the same "${JOB_TMP}:/tmp" the agent does -- passing it through this array is
-# what lets the judges be covered without editing judge_lib.sh.
+# (node-gyp shells out to python). SANDBOX_PYCACHE resolves because that exec
+# binds the same "${JOB_TMP}:${SANDBOX_TMP}" the agent does -- passing it through
+# this array is what lets the judges be covered without editing judge_lib.sh.
+# It is the variable and not a second literal for the reason given where the two
+# names are defined: judge_lib.sh's bind destination is the one string in this
+# pair that is not owned here, and tests/test_container_pycache.sh [2b] asserts
+# it still equals SANDBOX_TMP.
 #
 # Unlike the agent and scorer execs, this one carries no check_pycache.sh
 # assertion: the assertion has to run inside the exec to be worth anything (see
@@ -859,7 +914,7 @@ JUDGE_EXTRA_APPTAINER_ARGS=(
     --nv
     --env HF_HOME="${HF_HOME_NEW}"
     --env VLLM_API_KEY="inspectai"
-    --env PYTHONPYCACHEPREFIX="/tmp/pycache"
+    --env PYTHONPYCACHEPREFIX="${SANDBOX_PYCACHE}"
     --bind "${HF_MERGED}:${HF_HOME_NEW}"
 )
 [ -n "${POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND:-}" ] && \
@@ -1036,7 +1091,11 @@ run_evaluation() {
     # which is the unfixed behaviour with a variable set to make it look fixed.
     #
     # The --bind and the --env are adjacent on purpose: they are one fact, and
-    # check_pycache.sh below fails the attempt if they ever stop agreeing.
+    # check_pycache.sh below repairs the attempt -- and says so, loudly -- if they
+    # ever stop agreeing. It is sourced rather than run for the reason spelled out
+    # above the agent exec: its whole remedy is an export, and an export from a
+    # child process reaches nothing. Note that the positional parameters survive
+    # sourcing, so `exec python "$@"` still gets what the caller passed.
     #
     # That check runs as `bash -c '<check> || exit 1; exec python "$@"'` inside
     # this same exec rather than as a preflight exec of its own, so it measures
@@ -1066,7 +1125,7 @@ run_evaluation() {
         --env PYTHONPYCACHEPREFIX="${SCORER_PYCACHE}" \
         --pwd "$(pwd)/src/eval/tasks/${EVALUATION_TASK}" \
         ${POST_TRAIN_BENCH_CONTAINERS_DIR}/vllm_debug.sif \
-        bash -c 'bash "$0/src/utils/check_pycache.sh" || exit 1; exec python "$@"' \
+        bash -c '. "$0/src/utils/check_pycache.sh" || exit 1; exec python "$@"' \
             "${REPO_ROOT}" "${EVAL_SCRIPT}" \
             --model-path "$EVAL_DIR/final_model" \
             --templates-dir ../../../../src/eval/templates \
