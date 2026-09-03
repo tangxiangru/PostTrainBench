@@ -50,10 +50,12 @@ set -uo pipefail
 #   - inspect_ai's vllm provider takes a free port when none is given, so N
 #     concurrent servers do not fight over 8000. Cells are staggered anyway.
 #
-# Arms are given per GPU, so interleave them: "which arm" should not be the same
-# question as "which node" or "which GPU index".
+# Arms are given as the pack's composition, NOT as a per-GPU assignment: the
+# launcher draws the arm -> card map itself (see "ptb seat assignment" below).
+# Typing the same order twice used to mean running the same arm on the same
+# cards twice.
 #
-# Usage:  sbatch ptb_pack.sbatch <arm_gpu0> [<arm_gpu1> ...]     # up to 8
+# Usage:  sbatch ptb_pack.sbatch <arm> [<arm> ...]     # up to 8, order ignored
 ARMS=("$@")
 N="${#ARMS[@]}"
 { [ "$N" -ge 1 ] && [ "$N" -le 8 ]; } || { echo "FATAL: need 1..8 arm names, got ${N}" >&2; exit 1; }
@@ -184,6 +186,173 @@ case " ${ARMS[*]} " in
         echo "       PTB_NO_CONTROL=1 -- continuing without an in-pack control." >&2 ;;
 esac
 
+# >>> ptb seat assignment >>>
+# Which card an arm lands on is a treatment, not a formality.
+#
+# Until now the map was `arm="${ARMS[$gpu]}"`: seat 0 ran the first name the
+# operator typed, seat 1 the second. Every submit line of the ten-hour mainline
+# pair typed them in the same order, so across the entire published contrast
+# `sn` ran on g0/g2/g4/g6 and `r2` on g1/g3/g5/g7 -- every pack, every day.
+# NVLink neighbours, position in the chassis and so inlet temperature, the
+# `sleep $((gpu*STAGGER))` start offset, NUMA locality, and rank in the race for
+# host page cache and scratch bandwidth are all functions of the seat, and all
+# of them were 100% aliased with the arm. "+1.15 pt, p=0.51" is therefore a
+# statement about (arm AND even cards) against (arm AND odd cards). A null
+# survives that reading; a positive result would not have.
+#
+# So the seat is drawn, not typed. The draw is a pure function of (job id, pack
+# composition): re-running a job id reproduces its own map, and the map is
+# recomputable from the log line below years later. The draw is also
+# *restricted* -- balanced randomisation, the standard device: a draw that would
+# give any multi-seat arm only even cards, only odd cards, or only one half of
+# the chassis is rejected and the next draw taken. A one-seat arm is exempt (it
+# has no spread to have) and so is a pack below four seats.
+#
+# This block is extracted verbatim and sourced by tests/test_pack_seat_map.sh.
+# Keep it self-contained and keep the sentinel lines.
+PTB_SEAT_MAX_DRAWS="${PTB_SEAT_MAX_DRAWS:-1024}"
+
+ptb_seat_shuffle() {
+    # $1 seed string, $2 draw counter, $3 n (1..8). Prints a permutation of
+    # 0..n-1. Pure: same arguments, same answer, on any host, forever -- which
+    # is the whole reason the log line is enough to recover the map.
+    local seed="$1" draw="$2" n="$3" i j k tmp off=0 hex
+    hex="$(printf '%s|draw=%s' "$seed" "$draw" | sha256sum | cut -d' ' -f1)"
+    local -a a=()
+    for (( i=0; i<n; i++ )); do a+=("$i"); done
+    for (( i=n-1; i>0; i-- )); do   # Fisher-Yates, four hex digits per step
+        k=$(( 16#${hex:off:4} )); off=$(( off + 4 ))
+        j=$(( k % (i + 1) ))
+        tmp="${a[i]}"; a[i]="${a[j]}"; a[j]="$tmp"
+    done
+    printf '%s' "${a[*]}"
+}
+
+ptb_seat_confound() {
+    # $1 n, then the realised seat->arm names, seat 0 first. Prints one
+    # <arm>:<violation> line per offence and returns 1 when the map reproduces
+    # the confound this launcher exists to prevent.
+    local n="$1"; shift
+    local -a seats=("$@")
+    [ "$n" -ge 4 ] || return 0
+    local half=$(( n / 2 )) bad=0 a g even odd low high
+    local -a uniq=()
+    for a in "${seats[@]}"; do
+        case " ${uniq[*]:-} " in *" $a "*) ;; *) uniq+=("$a") ;; esac
+    done
+    for a in "${uniq[@]}"; do
+        even=0; odd=0; low=0; high=0
+        for (( g=0; g<n; g++ )); do
+            [ "${seats[$g]}" = "$a" ] || continue
+            if (( g % 2 == 0 )); then even=$(( even + 1 )); else odd=$(( odd + 1 )); fi
+            if (( g < half )); then low=$(( low + 1 )); else high=$(( high + 1 )); fi
+        done
+        (( even + odd >= 2 )) || continue    # one seat cannot be spread over two
+        (( even > 0 )) || { echo "${a}:every-seat-odd"; bad=1; }
+        (( odd  > 0 )) || { echo "${a}:every-seat-even"; bad=1; }
+        (( low  > 0 )) || { echo "${a}:every-seat-in-high-half"; bad=1; }
+        (( high > 0 )) || { echo "${a}:every-seat-in-low-half"; bad=1; }
+    done
+    return "$bad"
+}
+
+ptb_seat_plan() {
+    # $1 seed, then the arms as typed. On success sets PTB_SEATS (seat -> arm),
+    # PTB_SEAT_POS (seat -> index in the typed list), PTB_SEAT_SOURCE and
+    # PTB_SEAT_DRAWS. On refusal sets PTB_SEAT_REFUSAL / PTB_SEAT_REFUSAL_KIND
+    # and returns 1; the caller must exit before the allocation is spent.
+    #
+    # PTB_SEAT_MAP pins the map by hand -- "sn r2 r2 sn ..." or the same with
+    # commas, one arm per seat starting at g0. It may reorder the pack; it may
+    # not change what is in it, and it is held to the same balance rule as a
+    # drawn map, because the point of the rule is the map, not its provenance.
+    local seed="$1"; shift
+    local -a arms=("$@")
+    local n="${#arms[@]}" i j draw viol want got
+    PTB_SEATS=(); PTB_SEAT_POS=(); PTB_SEAT_DRAWS=0
+    PTB_SEAT_REFUSAL=""; PTB_SEAT_REFUSAL_KIND=""; PTB_SEAT_SOURCE="drawn"
+    if [ -n "${PTB_SEAT_MAP:-}" ]; then
+        PTB_SEAT_SOURCE="pinned"
+        read -r -a PTB_SEATS <<< "${PTB_SEAT_MAP//,/ }"
+        if [ "${#PTB_SEATS[@]}" -ne "$n" ]; then
+            PTB_SEAT_REFUSAL_KIND="malformed"
+            PTB_SEAT_REFUSAL="PTB_SEAT_MAP names ${#PTB_SEATS[@]} seats, the pack has ${n}"
+            return 1
+        fi
+        want="$(printf '%s\n' "${arms[@]}" | LC_ALL=C sort | tr '\n' ' ')"
+        got="$(printf '%s\n' "${PTB_SEATS[@]}" | LC_ALL=C sort | tr '\n' ' ')"
+        if [ "$want" != "$got" ]; then
+            PTB_SEAT_REFUSAL_KIND="malformed"
+            PTB_SEAT_REFUSAL="PTB_SEAT_MAP is not a permutation of the pack: [${got% }] not [${want% }]"
+            return 1
+        fi
+        local -a used=()
+        for (( i=0; i<n; i++ )); do used+=(0); done
+        for (( i=0; i<n; i++ )); do
+            for (( j=0; j<n; j++ )); do
+                if [ "${used[$j]}" = "0" ] && [ "${arms[$j]}" = "${PTB_SEATS[$i]}" ]; then
+                    PTB_SEAT_POS+=("$j"); used[$j]=1; break
+                fi
+            done
+        done
+    else
+        local -a perm=()
+        for (( draw=1; draw<=PTB_SEAT_MAX_DRAWS; draw++ )); do
+            read -r -a perm <<< "$(ptb_seat_shuffle "$seed" "$draw" "$n")"
+            PTB_SEATS=()
+            for i in "${perm[@]}"; do PTB_SEATS+=("${arms[$i]}"); done
+            PTB_SEAT_DRAWS="$draw"
+            if ptb_seat_confound "$n" "${PTB_SEATS[@]}" >/dev/null; then
+                PTB_SEAT_POS=("${perm[@]}")
+                return 0
+            fi
+        done
+        # Unreachable in practice: every one of the 66 pack shapes with 1 <= n <= 8
+        # admits a balanced map (enumerated exhaustively), and the tightest shape,
+        # four two-seat arms on eight cards, accepts 96 of 2520 maps. 1024 draws
+        # miss it with probability (1-0.038)^1024 ~ 6e-18. So if this line is ever
+        # printed it is a fact about the code, not about the luck of the draw --
+        # do not paper over it with more draws.
+        PTB_SEAT_REFUSAL_KIND="unsatisfiable"
+        PTB_SEAT_REFUSAL="no balanced seat map after ${PTB_SEAT_MAX_DRAWS} draws for arms=[${arms[*]}]"
+        return 1
+    fi
+    viol="$(ptb_seat_confound "$n" "${PTB_SEATS[@]}")" || {
+        PTB_SEAT_REFUSAL_KIND="confound"
+        PTB_SEAT_REFUSAL="PTB_SEAT_MAP reproduces the arm/seat confound: ${viol//$'\n'/ }"
+        return 1
+    }
+    return 0
+}
+# <<< ptb seat assignment <<<
+
+SEAT_SEED="${SLURM_JOB_ID:-0}|${ARMS[*]}"
+if ! ptb_seat_plan "$SEAT_SEED" "${ARMS[@]}"; then
+    echo "FATAL: ${PTB_SEAT_REFUSAL}" >&2
+    echo "       An arm that only ever draws one parity or one half of the" >&2
+    echo "       chassis is not being compared with the other arm, it is being" >&2
+    echo "       compared with a seat: NVLink neighbours, inlet temperature," >&2
+    echo "       the staggered start and the race for host page cache all" >&2
+    echo "       follow the card index. That is the confound this launcher" >&2
+    echo "       exists to prevent and it will not reproduce it." >&2
+    if [ "${PTB_SEAT_REFUSAL_KIND}" = "confound" ]; then
+        echo "       Drop PTB_SEAT_MAP, or set PTB_ALLOW_SEAT_CONFOUND=1 to pin a" >&2
+        echo "       historical map on purpose -- which voids the between-arm" >&2
+        echo "       contrast for this pack." >&2
+        [ "${PTB_ALLOW_SEAT_CONFOUND:-0}" = "1" ] || exit 1
+        echo "       PTB_ALLOW_SEAT_CONFOUND=1 -- continuing with a confounded map." >&2
+    else
+        exit 1
+    fi
+fi
+_seat_flat=""
+for (( _g=0; _g<N; _g++ )); do
+    _seat_flat="${_seat_flat} g${_g}=${PTB_SEATS[$_g]}"
+    echo "seat gpu=${_g} arm=${PTB_SEATS[$_g]} typed_pos=${PTB_SEAT_POS[$_g]}"
+done
+echo "seat_map${_seat_flat}"
+echo "seat_source=${PTB_SEAT_SOURCE} seat_draws=${PTB_SEAT_DRAWS} seat_confound=${PTB_SEAT_REFUSAL_KIND:-none} seat_seed=${SEAT_SEED}"
+
 # `**/test_data.json` is gitignored on purpose -- it is the task's test set -- so a
 # `git clone` of this repo produces a checkout that looks complete and has no test data.
 # run_task.sh only notices once it is already inside the cell, which is how 84279 and
@@ -223,7 +392,10 @@ echo "run_task=${RUN_TASK}"
 LOGDIR="/rmeng_data/robtang/PostTrainBench/slurm_logs"
 declare -a PIDS=()
 for (( gpu=0; gpu<N; gpu++ )); do
-    arm="${ARMS[$gpu]}"
+    # PTB_SEATS, not ARMS: the seat is drawn above. The stagger below is keyed on
+    # the seat too, deliberately -- start order is one of the things the seat was
+    # aliased with, so it has to be randomised with it, not held to typed order.
+    arm="${PTB_SEATS[$gpu]}"
     cell="${SLURM_JOB_ID}_g${gpu}"
     log="${LOGDIR}/ptb-pack-${SLURM_JOB_ID}-g${gpu}-${arm}.log"
     (
@@ -242,7 +414,7 @@ rc_all=0
 for (( gpu=0; gpu<N; gpu++ )); do
     wait "${PIDS[$gpu]}"
     rc=$?
-    echo "cell_exit gpu=${gpu} arm=${ARMS[$gpu]} cell=${SLURM_JOB_ID}_g${gpu} rc=${rc}"
+    echo "cell_exit gpu=${gpu} arm=${PTB_SEATS[$gpu]} cell=${SLURM_JOB_ID}_g${gpu} rc=${rc}"
     # What decode did this cell ship? `evaluate.py` passes no temperature, so vLLM uses
     # whatever the delivered generation_config.json says, and that single flag explains
     # r^2 = 0.914 of the between-arm variance on the one-hour board (nine arms, n=64):
@@ -251,13 +423,13 @@ for (( gpu=0; gpu<N; gpu++ )); do
     # went digging in final_model/ after the fact. Print it next to the exit code.
     _gc="$(ls -1 "${POST_TRAIN_BENCH_RESULTS_DIR:-/rmeng_data/robtang/ptb-results}"/*/"${TASK}"_*_"${SLURM_JOB_ID}_g${gpu}"/final_model/generation_config.json 2>/dev/null | head -1)"
     if [ -n "${_gc}" ]; then
-        echo "cell_decode gpu=${gpu} arm=${ARMS[$gpu]} $(python3 -c '
+        echo "cell_decode gpu=${gpu} arm=${PTB_SEATS[$gpu]} $(python3 -c '
 import json,sys
 d=json.load(open(sys.argv[1]))
 print(" ".join(f"{k}={d.get(k)}" for k in ("temperature","top_p","top_k","do_sample")))
 ' "${_gc}" 2>/dev/null || echo 'unparseable')"
     else
-        echo "cell_decode gpu=${gpu} arm=${ARMS[$gpu]} no generation_config.json shipped"
+        echo "cell_decode gpu=${gpu} arm=${PTB_SEATS[$gpu]} no generation_config.json shipped"
     fi
     [ "$rc" -eq 0 ] || rc_all=1
 done

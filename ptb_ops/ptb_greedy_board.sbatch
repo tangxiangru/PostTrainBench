@@ -143,7 +143,17 @@ score_one() {
     local tmp="${POST_TRAIN_BENCH_TMP_ROOT:-/tmp}/ptb_greedy_${SLURM_JOB_ID}_g${gpu}"
     local merged="${tmp}/merged_huggingface"
     local incache="/tmp/hf_cache_rescore"
-    rm -rf "${tmp}"; mkdir -p "${merged}" "${tmp}/upper_huggingface" "${tmp}/fuse_workdir"
+    # Bytecode goes to node-local scratch, not to the 64 MiB --writable-tmpfs
+    # container root: nothing in vllm_debug.sif is precompiled (uv installs
+    # --no-cache and does not byte-compile; 24602 .py against 886 .pyc in
+    # dist-packages) and one `import transformers, torch, vllm` writes 41 MiB of
+    # .pyc, so ENOSPC and a truncated .pyc are the default outcome, not an edge
+    # case. Per-worker, under ${tmp}, for two reasons the shared ${incache} name
+    # does not satisfy: eight workers writing one prefix concurrently would race
+    # on the same .pyc paths, and ${tmp} is the thing rm -rf'd at the end of this
+    # function, so the bytecode dies with the worker that made it.
+    local pycache="${tmp}/pycache"
+    rm -rf "${tmp}"; mkdir -p "${merged}" "${tmp}/upper_huggingface" "${tmp}/fuse_workdir" "${pycache}"
     fuse-overlayfs -o "lowerdir=${HF_HOME},upperdir=${tmp}/upper_huggingface,workdir=${tmp}/fuse_workdir" "${merged}" \
         || { echo "FATAL: overlay failed for ${label}" >&2; return 1; }
 
@@ -164,10 +174,28 @@ score_one() {
         extra_bind=(--bind "${BASE_BIND}:${BASE_BIND}")
     fi
 
+    # Unset by default; the full argument is in src/run_task.sh next to
+    # POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND. 89810_g5 lost 7 of 43 grader
+    # invocations to a CUDA illegal-memory-access until it set TRITON_ATTN by
+    # hand, but the cost of TRITON_ATTN at these shapes is unmeasured, so pinning
+    # it would trade a rare crash for a tax on all 26 cells in this batch. This
+    # job is the cheapest place to measure it: same node, same decode, 8 cells
+    # at a time.
+    local -a attn_backend_env=()
+    [ -n "${POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND:-}" ] && \
+        attn_backend_env=(--env "VLLM_ATTENTION_BACKEND=${POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND}")
+
     # --nv exposes all eight cards regardless of the allocation, so the card this cell
     # uses is decided by CUDA_VISIBLE_DEVICES inside the container and nothing else.
     # There is no GPU renumbering here (that is run_task.sh's POST_TRAIN_BENCH_ISOLATE_GPUS),
     # so host index and container index agree.
+    #
+    # check_pycache.sh runs inside this exec, ahead of python, so it measures the bind
+    # list that is actually in force -- a preflight exec of its own would carry a second
+    # copy of the pycache bind and could not notice this one losing it. It is reachable
+    # because ${REPO_ROOT} lives under the /rmeng_data/robtang bind below. $0 carries the
+    # repo root and everything after it is positional, so nothing inside the single-quoted
+    # script is expanded here, and `exec` leaves python as the process whose rc this reads.
     CUDA_VISIBLE_DEVICES="${gpu}" NUM_GPUS=1 apptainer exec \
         --nv \
         --env CUDA_VISIBLE_DEVICES="${gpu}" \
@@ -175,14 +203,18 @@ score_one() {
         --env HF_HUB_CACHE="${incache}/hub" \
         --env HUGGINGFACE_HUB_CACHE="${incache}/hub" \
         --env VLLM_API_KEY="inspectai" \
+        "${attn_backend_env[@]}" \
         "${cache_bind[@]}" \
         "${extra_bind[@]}" \
         --writable-tmpfs \
         --bind "/rmeng_data/robtang:/rmeng_data/robtang" \
         --bind "${merged}:${incache}" \
+        --bind "${pycache}:${pycache}" \
+        --env PYTHONPYCACHEPREFIX="${pycache}" \
         --pwd "${REPO_ROOT}/src/eval/tasks/${TASK}" \
         "${POST_TRAIN_BENCH_CONTAINERS_DIR}/vllm_debug.sif" \
-        python evaluate.py \
+        bash -c 'bash "$0/src/utils/check_pycache.sh" || exit 1; exec python "$@"' \
+            "${REPO_ROOT}" evaluate.py \
             --model-path "${model}" \
             --templates-dir ../../../../src/eval/templates \
             --limit -1 \
