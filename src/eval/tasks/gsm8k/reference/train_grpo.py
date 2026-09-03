@@ -156,6 +156,15 @@ DEFAULT_SAVE_STEPS = 50
 #: discover it after a preemption.
 DEFAULT_SAVE_TOTAL_LIMIT = 10
 
+#: Rollout truncation rate above which TerminationMonitor says something. Not a knob and
+#: not acted on: it is the point at which a rate stops being background and starts being
+#: the thing to fix. 91038_g7 and 91036_g6, two of the three cells in the arm's ~69 tail,
+#: both ran at ~0.40 here and both worked it out by hand -- 91038_g7 filed it as "a defect
+#: in the training configuration ... 40% of rollouts are truncated and scored zero",
+#: having reasoned that a truncated completion rarely ends on its final answer, so those
+#: rollouts contribute a zero that says nothing about the policy.
+TRUNCATION_WARN = 0.25
+
 #: What goes into the shipped ``generation_config.json``. vLLM 0.11.0 (the version
 #: ``containers/opus_5.def`` pins, and the one the grader runs behind
 #: ``inspect_ai``) switches to ``SamplingType.GREEDY`` when ``temperature <
@@ -727,75 +736,99 @@ def _make_termination_monitor_class():
     from transformers import TrainerCallback
 
     class TerminationMonitor(TrainerCallback):
-        """Watch greedy termination, and stop GRPO from training it away.
+        """Decode the way the grader decodes, during training, and halt when it breaks.
 
-        This is README defect 3 wearing its third hat. The first two are about a
-        stop token the model cannot *reach*: the template closes an assistant turn
-        with a token the base model never emits, generation runs to the cap, and the
-        last-number scorer grades the tail. Both are fixed before step zero, on the
-        decode side, by :func:`derive_stop_token` and :func:`ensure_stop_tokens`.
+        This is README defect 3 wearing its third hat, and the hat is a train/serve
+        skew rather than a bug in either half. GRPO optimises a reward computed on
+        *sampled* rollouts capped at ``--max-completion-length`` (512). The grade is
+        computed on a *greedy* decode capped at 4000. Nothing in the training loop
+        ever performs the second one, so the two can come apart silently and every
+        number the trainer prints stays green while the thing being graded falls
+        apart.
 
-        The third hat is that RL can take a working stop token back, and nothing on
-        the decode side can see it happen. :func:`make_reward_fn` is binary on
-        :func:`grade_completion`, that grades the trailing number, and neither asks
-        whether the rollout ended -- so a rollout that hits the 512-token cap with
-        the right number somewhere in its tail earns the full reward and the full
-        gradient. "Never stop, keep talking until a correct number goes past" is a
-        policy this objective pays for.
+        Cell 91039_g7 of the 2026-09-03 campaign is the worked example, and it is
+        worth stating precisely because the obvious reading of it is wrong. Its
+        ladder picked rung 1e-5 on a pre-registered rule, and its own telemetry
+        endorsed the pick: reward 0.231 -> 0.562, ``completions/clipped_ratio``
+        **max 0.086**, mean completion length 185 of a 512 cap, entropy 0.632 ->
+        0.495, and -- in its own words -- "no kill criterion fired through step 30".
+        Sampled rollouts terminated. Then the graded read of that checkpoint decoded
+        greedily and produced completions averaging 13,425 characters, ran into the
+        grader's 4000-token cap, and scored 19.41% on the 170 rows it got through
+        before being killed: "the completions are running to the grader's 4000-token
+        cap and being scored on whatever number happens to be last in a page of
+        unrelated text". The cell concluded "there is no rate in the ladder that does
+        both", abandoned RL and shipped its SFT plateau at 73.01. The fourteen cells
+        that shipped GRPO at 1e-5 without this happening averaged 83.2.
 
-        Cell 91039_g7 of the 2026-09-03 campaign ran the ladder cleanly -- same SFT
-        parent, same seed, same data order, learning rate the only thing varying --
-        and found 1e-6 and 3e-6 both moved rollout reward *down* (-0.0266, -0.0203)
-        while 1e-5 moved it up +0.3313. It shipped from none of them: at 1e-5 greedy
-        stop_fraction reached 0.0 and mean_greedy_tokens the full 1024, so it wrote
-        grpo_greedy_termination_failure.json, concluded "the learning rates that move
-        rollout reward are exactly the learning rates that destroy greedy termination
-        -- there is no rate in the ladder that does both", abandoned RL and shipped
-        its SFT plateau at 73.01. The fourteen cells that shipped GRPO at 1e-5
-        without collapsing averaged 83.2. It was not wrong about what it measured. It
-        was missing the flag that breaks the tie, and the flag is hard to reach for
-        because both of its settings are wrong half the time.
+        No sampled statistic would have caught that -- 0.086 clipped is a healthy
+        run -- which is the whole reason this probe generates instead of reading a
+        metric. Every ``--termination-probe-steps`` steps it decodes a handful of
+        training prompts greedily, at length, and reports the fraction that reach the
+        stop token. A rollout sampled at temperature 1.0 wanders into the stop token
+        eventually; a greedy decode of the same policy can loop forever, and only the
+        second one is what the grader will do.
 
-        So this resolves them by timing rather than by shaping. Masking stays off
-        until termination has actually been achieved, and latches on if it is then
-        lost. A model that never learns to stop is never masked, which makes ``auto``
-        a no-op on exactly the runs the "masking zeroes the batch" objection is
-        about. Reward, dataset, curriculum and learning rate are untouched, so this
-        stays a baseline rather than a recipe: the only thing it refuses to do is let
-        the loss keep paying for completions that never terminated.
+        Two consequences, both of which the cells asked for in their own logs:
+
+        * A probe that passes marks a checkpoint worth keeping (``should_save``), so
+          the last decode-healthy model is on disk rather than reconstructable.
+        * A probe that fails after one has passed halts training (``should_save``
+          then ``should_training_stop``). Continuing is not neutral: the run that
+          produced the 19.41% read had spent its remaining budget making the model
+          worse while its loss curve improved.
+
+        Separately, ``on_log`` watches TRL's ``completions/clipped_ratio`` -- not to
+        act on, but because 91038_g7 and 91036_g6, the other two cells in the ~69
+        tail, both hit ~40% of rollouts truncating at the cap and both diagnosed it
+        by hand. 91038_g7 filed it as "a defect in the training configuration ... 40%
+        of rollouts are truncated and scored zero", having worked out that a
+        truncated completion cannot contain a parseable final answer, so two rollouts
+        in five were contributing a zero that says nothing about the policy. That is
+        worth one loud line at the point it becomes true rather than an afternoon of
+        somebody re-deriving it.
+
+        Nothing here shapes the reward, picks a learning rate, or touches the
+        dataset. It measures the quantity the score is computed from, which the
+        training loop otherwise never looks at, and refuses to keep spending GPU
+        hours after that quantity has collapsed.
         """
 
-        # TRL 0.27.2 computes this at grpo_trainer.py:1782 as the fraction of rollouts
-        # whose last token is neither eos nor pad, gathers it across processes (:1783),
-        # appends it to _metrics (:1784), and its log() merges _metrics into the dict
-        # handed to on_log. main() has already pointed tokenizer.eos_token at the
-        # template's closing token, so this counts exactly the rollouts that failed to
-        # emit the token the grader stops on. There is nothing to generate and nothing
-        # to measure ourselves; the signal is already in the log line.
         CLIPPED_KEYS = ("completions/clipped_ratio", "clipped_ratio")
 
-        def __init__(self, mode, floor: float):
-            self.mode = mode
+        def __init__(self, floor, probe_steps, probe_prompts, probe_tokens,
+                     halt=True, tokenizer=None, prompts=None, stop_token_id=None):
             self.floor = floor
+            self.probe_steps = probe_steps
+            self.probe_tokens = probe_tokens
+            self.halt = halt
+            self.tokenizer = tokenizer
+            self.prompts = list(prompts or [])[:probe_prompts]
+            self.stop_token_id = stop_token_id
             self.trainer = None
-            self.armed = False       # termination was reached at least once
-            self.engaged = False     # collapse seen; masking latched on
-            self.engaged_step = None
+            self.armed = False        # a greedy probe has passed at least once
+            self.collapsed = False
+            self.collapsed_step = None
+            self.last_good_step = None
             self.best = 0.0
-            self.last = None
-            self.trace = []
+            self.probes = []          # [(step, stop_fraction, mean_new_tokens)]
+            self.clipped = []         # [(step, clipped_ratio)]
+            self.failures = 0
+            self.disabled = False
+            self.truncation_warned = False
             self.missing_warned = False
 
         def bind(self, trainer) -> None:
-            """Give the callback the trainer whose flag it flips.
+            """Hand the callback the trainer. Kept for symmetry with the guard.
 
-            TRL reads ``self.mask_truncated_completions`` off the *trainer*
-            (grpo_trainer.py:1868), having copied it out of the config once in
-            ``__init__`` (:492). Setting it on ``trainer.args`` after construction
-            therefore does nothing whatsoever, and a callback is only ever handed
-            ``args`` -- the TrainingArguments -- so the handle has to arrive here.
+            A callback is only ever passed ``args`` -- the TrainingArguments -- and
+            some of what is worth reading (the vLLM handle, the config actually in
+            force) lives on the trainer, which does not exist until after the
+            callback list has been built.
             """
             self.trainer = trainer
+
+        # -- the sampled statistic, watched but not acted on ------------------------
 
         def _ratio(self, logs):
             for key in self.CLIPPED_KEYS:
@@ -810,79 +843,167 @@ def _make_termination_monitor_class():
                 if not self.missing_warned:
                     self.missing_warned = True
                     logger.warning(
-                        "termination monitor: no %s in the trainer's logs (saw %s). "
-                        "Termination is unwatched for this run.",
+                        "termination monitor: no %s in the trainer's logs (saw %s)",
                         " or ".join(self.CLIPPED_KEYS), sorted(logs or {}),
                     )
                 return
-            terminated = 1.0 - ratio
-            self.last = terminated
-            self.best = max(self.best, terminated)
-            self.trace.append((int(state.global_step), round(terminated, 4)))
+            self.clipped.append((int(state.global_step), round(ratio, 4)))
+            if ratio >= TRUNCATION_WARN and not self.truncation_warned:
+                self.truncation_warned = True
+                logger.warning(
+                    "%.0f%% of rollouts hit the %d-token completion cap at step %d. A "
+                    "truncated completion rarely ends on its final answer, so most of "
+                    "those score 0 and contribute a gradient that says nothing about "
+                    "the policy. Raise --max-completion-length, or pass "
+                    "--mask-truncated-completions to drop them from the loss. This is "
+                    "what 91038_g7 and 91036_g6 both found by hand.",
+                    100.0 * ratio, args.max_completion_length, state.global_step,
+                )
 
-            if terminated >= self.floor:
+        # -- the greedy probe, which is the one the grade is computed from ----------
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if self.disabled or self.probe_steps <= 0 or not self.prompts:
+                return
+            step = int(state.global_step)
+            if step <= 0 or step % self.probe_steps:
+                return
+            result = self._probe(kwargs.get("model"))
+            if result is None:
+                return
+            stop_fraction, mean_new = result
+            self.best = max(self.best, stop_fraction)
+            self.probes.append((step, round(stop_fraction, 4), round(mean_new, 1)))
+            logger.info(
+                "greedy probe at step %d: %.1f%% of %d prompts reached the stop token "
+                "in %d tokens (mean %.0f generated)",
+                step, 100.0 * stop_fraction, len(self.prompts), self.probe_tokens,
+                mean_new,
+            )
+            if stop_fraction >= self.floor:
                 if not self.armed:
                     self.armed = True
-                    logger.info(
-                        "termination monitor: armed at step %d (%.1f%% of rollouts end "
-                        "on the stop token)", state.global_step, 100.0 * terminated,
-                    )
+                    logger.info("greedy probe: armed at step %d", step)
+                self.last_good_step = step
+                # Keep the last decode-healthy weights on disk. save_steps defaults to
+                # 50 and the collapse above happened by step 30, so without this the
+                # only artefact of a run that dies is the model that died.
+                control.should_save = True
                 return
-            if not self.armed or self.engaged:
-                # Not armed: this model has never stopped reliably, so a low number is
-                # a model still learning rather than a model unlearning, and nothing
-                # happens. That is the whole of the "masking zeroes the batch" case.
+            if not self.armed or self.collapsed:
+                # Never yet healthy: the model has not learned to stop, which is a
+                # model still training rather than a model being destroyed.
                 return
 
-            self.engaged = True
-            self.engaged_step = int(state.global_step)
+            self.collapsed = True
+            self.collapsed_step = step
             logger.error(
-                "termination collapse at step %d: %.1f%% of rollouts end on the stop "
-                "token, best was %.1f%%, floor %.1f%%. The reward does not price this "
-                "-- grade_completion() grades the trailing number of a rollout that "
-                "never finished -- so training reward can keep climbing while the model "
-                "you ship can no longer stop.",
-                self.engaged_step, 100.0 * terminated, 100.0 * self.best,
-                100.0 * self.floor,
+                "GREEDY TERMINATION COLLAPSE at step %d: %.1f%% of probes reach the "
+                "stop token, best was %.1f%%, floor %.1f%%. Sampled rollouts can still "
+                "look healthy here -- 91039_g7 had clipped_ratio max 0.086 and no kill "
+                "criterion at the moment its graded read was decoding 13k characters "
+                "per row and scoring 19.41%%. The reward is computed on sampled "
+                "rollouts; the grade is not.",
+                step, 100.0 * stop_fraction, 100.0 * self.best, 100.0 * self.floor,
             )
-            if self.mode == MASK_AUTO:
-                if self.trainer is None:
-                    logger.error(
-                        "termination monitor: no trainer bound, cannot enable masking. "
-                        "That is a wiring bug in main(); see TerminationMonitor.bind."
-                    )
-                else:
-                    self.trainer.mask_truncated_completions = True
-                    logger.error(
-                        "--mask-truncated-completions=%s: masking is ON from step %d. "
-                        "Truncated rollouts stop contributing to the loss.",
-                        MASK_AUTO, self.engaged_step,
-                    )
-            else:
-                logger.error(
-                    "--mask-truncated-completions=%s: leaving the loss alone. Pass %s "
-                    "to have this handled when it happens.", self.mode, MASK_AUTO,
-                )
             self._write(args, "grpo_termination_collapse.json")
+            if self.halt:
+                control.should_save = True
+                control.should_training_stop = True
+                logger.error(
+                    "halting. The last probe to pass was step %s; prefer that "
+                    "checkpoint over `final`, and score it before shipping. Pass "
+                    "--no-termination-halt to train through this instead.",
+                    self.last_good_step,
+                )
+
+        def _probe(self, model):
+            """Greedy-decode the probe prompts. Never raises; disables itself instead.
+
+            Runs on every rank rather than on rank zero alone: under ZeRO-3 or FSDP a
+            forward pass is a collective, and a probe that only rank zero enters is a
+            hang rather than a measurement. The duplicated work is a few seconds of a
+            1.7B model.
+            """
+            if model is None:
+                return None
+            try:
+                import torch
+
+                was_training = model.training
+                model.eval()
+                try:
+                    texts = [
+                        self.tokenizer.apply_chat_template(
+                            p, tokenize=False, add_generation_prompt=True
+                        )
+                        for p in self.prompts
+                    ]
+                    enc = self.tokenizer(texts, return_tensors="pt", padding=True,
+                                         padding_side="left")
+                    device = next(model.parameters()).device
+                    enc = {k: v.to(device) for k, v in enc.items()}
+                    pad_id = self.tokenizer.pad_token_id
+                    if pad_id is None:
+                        pad_id = self.stop_token_id
+                    with torch.no_grad():
+                        out = model.generate(
+                            **enc,
+                            max_new_tokens=self.probe_tokens,
+                            do_sample=False,
+                            temperature=None,
+                            top_p=None,
+                            top_k=None,
+                            eos_token_id=self.stop_token_id,
+                            pad_token_id=pad_id,
+                        )
+                finally:
+                    if was_training:
+                        model.train()
+                grown = out[:, enc["input_ids"].shape[1]:]
+                stopped, lengths = 0, []
+                for row in grown.tolist():
+                    if self.stop_token_id is not None and self.stop_token_id in row:
+                        stopped += 1
+                        lengths.append(row.index(self.stop_token_id) + 1)
+                    else:
+                        lengths.append(len(row))
+                return stopped / len(grown), sum(lengths) / len(lengths)
+            except Exception as exc:  # noqa: BLE001 -- see the docstring
+                self.failures += 1
+                logger.error("greedy probe failed (%s): %s", type(exc).__name__, exc)
+                if self.failures >= 2:
+                    self.disabled = True
+                    logger.error(
+                        "greedy probe disabled after %d failures. Training continues "
+                        "UNWATCHED: nothing is now checking that the model can still "
+                        "stop when decoded the way the grader decodes it.",
+                        self.failures,
+                    )
+                return None
 
         def on_train_end(self, args, state, control, **kwargs):
-            # Written whether or not anything went wrong. "Termination held all the way
-            # through" is the sentence a cell needs to rule this out and go looking
-            # somewhere else, and it is worth as much as the alarm is.
+            # Written on every run. "Termination held the whole way" is the sentence a
+            # cell needs in order to rule this out and go and look somewhere else, and
+            # it is worth as much as the alarm is.
             self._write(args, "grpo_termination_trace.json")
 
         def _write(self, args, name) -> None:
             path = os.path.join(args.output_dir, name)
             payload = {
-                "mode": self.mode,
                 "floor": self.floor,
+                "probe_steps": self.probe_steps,
+                "probe_tokens": self.probe_tokens,
+                "probe_prompts": len(self.prompts),
+                "halt": self.halt,
                 "armed": self.armed,
-                "collapsed": self.engaged,
-                "masking_engaged_at_step": self.engaged_step,
-                "best_terminated_fraction": round(self.best, 4),
-                "last_terminated_fraction":
-                    None if self.last is None else round(self.last, 4),
-                "trace": self.trace,
+                "collapsed": self.collapsed,
+                "collapsed_at_step": self.collapsed_step,
+                "last_good_step": self.last_good_step,
+                "best_stop_fraction": round(self.best, 4),
+                "probe_disabled": self.disabled,
+                "greedy_probes": self.probes,
+                "sampled_clipped_ratio": self.clipped,
             }
             try:
                 os.makedirs(args.output_dir, exist_ok=True)
@@ -1034,39 +1155,6 @@ class BooleanFlag(argparse.Action):
         return " | ".join(self.option_strings)
 
 
-MASK_AUTO = "auto"
-
-
-class MaskModeFlag(BooleanFlag):
-    """`--mask-truncated-completions` is a boolean that also accepts ``auto``.
-
-    ``auto`` is neither "on" nor "off": it is off until the model has demonstrated
-    that it can stop, and on from the moment it stops being able to. The two
-    booleans are each wrong half the time -- see the flag's help text -- and a
-    third value is the only way to have both without shaping the reward.
-
-    Subclassed rather than replaced with ``type=`` so the bare flag and the
-    ``--no-`` spelling keep working; :class:`BooleanFlag` explains why that costs
-    a campaign two probe launches when it does not.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.metavar = "BOOL|auto"
-
-    def __call__(self, parser, namespace, value, option_string=None):
-        if value is not None and str(value).strip().lower() == MASK_AUTO:
-            if (option_string or "").startswith("--no-"):
-                raise argparse.ArgumentError(self, (
-                    f"{option_string} {MASK_AUTO} has no meaning. Pass "
-                    f"--{self.dest.replace('_', '-')} {MASK_AUTO} to arm it, or "
-                    f"{option_string} on its own to turn masking off outright."
-                ))
-            setattr(namespace, self.dest, MASK_AUTO)
-            return
-        super().__call__(parser, namespace, value, option_string)
-
-
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -1119,25 +1207,30 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--top-k", type=int, default=0, help="rollout top_k; 0 disables")
     g.add_argument("--num-iterations", type=int, default=1, help="mu in the GRPO paper")
     g.add_argument("--epsilon", type=float, default=0.2, help="PPO-style clip range")
-    # Both booleans are wrong half the time, so the default is neither of them.
-    # FALSE (TRL's default) leaves a hole: the reward is binary on
-    # grade_completion(), which grades the trailing number and never asks whether
-    # the rollout ended, so a completion that runs into the cap with the right
-    # number in its tail collects full reward and full gradient. TRUE closes it and
-    # opens another: early in training a base model almost never emits the stop
-    # token, so nearly every rollout is truncated, masking zeroes most of the batch,
-    # and the run makes no progress while looking perfectly healthy in the logs.
-    # AUTO is off until termination is reached and on if it is then lost, which is
-    # the only reading under which both objections are answered at once. It is a
-    # no-op on a run that never learns to stop -- see TerminationMonitor.
-    g.add_argument("--mask-truncated-completions", action=MaskModeFlag, default=MASK_AUTO,
-                   help="drop rollouts that hit the completion cap instead of scoring "
-                        "their tail; 'auto' does it only after termination collapses")
-    g.add_argument("--termination-floor", type=float, default=0.90,
-                   help="fraction of rollouts that must end on the stop token; falling "
-                        "below this after once clearing it is what 'auto' reacts to")
+    # TRL's default, and worth leaving alone until the model can stop. Early in training a
+    # base model almost never emits the stop token, so nearly every rollout is truncated;
+    # masking them then zeroes most of the batch and the run makes no progress while
+    # looking perfectly healthy in the logs. Grading the tail is also what the frozen
+    # scorer does, just at 4000 tokens instead of 512. TerminationMonitor prints the
+    # rollout truncation rate and says so when it gets high enough to be worth this flag.
+    g.add_argument("--mask-truncated-completions", action=b, default=False,
+                   help="drop rollouts that hit the completion cap instead of scoring their tail")
     g.add_argument("--reward-match", default="grader", choices=["grader", "strict"],
                    help="'strict' compares the extracted number with == instead of endswith")
+    # The reward is computed on sampled rollouts capped at --max-completion-length;
+    # the grade is computed on a GREEDY decode capped at 4000. Nothing else in this
+    # loop ever performs the second one, and 91039_g7 shipped an SFT plateau at 73.01
+    # because of the gap. See TerminationMonitor.
+    g.add_argument("--termination-probe-steps", type=int, default=25,
+                   help="greedy-decode a few prompts every N steps; 0 disables the probe")
+    g.add_argument("--termination-probe-prompts", type=int, default=16,
+                   help="how many training prompts each greedy probe decodes")
+    g.add_argument("--termination-probe-tokens", type=int, default=1024,
+                   help="token budget per probe; long enough that a looping policy shows")
+    g.add_argument("--termination-floor", type=float, default=0.90,
+                   help="fraction of probes that must reach the stop token")
+    g.add_argument("--termination-halt", action=b, default=True,
+                   help="stop training if a passing greedy probe is later failed")
     g.add_argument("--num-train-epochs", type=float, default=DEFAULT_NUM_TRAIN_EPOCHS)
     g.add_argument("--max-steps", type=int, default=-1, help="-1 = bounded by epochs")
     g.add_argument("--seed", type=int, default=0)
@@ -1264,12 +1357,6 @@ def main(argv=None) -> int:
 
     generation_kwargs = build_generation_kwargs(args.use_vllm, stop_token_id)
 
-    # `auto` starts masking off and lets TerminationMonitor latch it on; only an
-    # explicit True starts it on. `is True` rather than truthiness because the
-    # string "auto" is truthy and would silently mean the opposite of itself.
-    mask_mode = args.mask_truncated_completions
-    mask_at_start = mask_mode is True
-
     config = GRPOConfig(
         output_dir=args.output_dir,
         learning_rate=args.learning_rate,
@@ -1288,7 +1375,7 @@ def main(argv=None) -> int:
         top_k=args.top_k,
         num_iterations=args.num_iterations,
         epsilon=args.epsilon,
-        mask_truncated_completions=mask_at_start,
+        mask_truncated_completions=args.mask_truncated_completions,
         num_train_epochs=args.num_train_epochs,
         max_steps=args.max_steps,
         seed=args.seed,
@@ -1308,7 +1395,19 @@ def main(argv=None) -> int:
         report_to=args.report_to,
     )
 
-    monitor = _make_termination_monitor_class()(mask_mode, args.termination_floor)
+    monitor = _make_termination_monitor_class()(
+        args.termination_floor,
+        args.termination_probe_steps,
+        args.termination_probe_prompts,
+        args.termination_probe_tokens,
+        halt=args.termination_halt,
+        tokenizer=tokenizer,
+        # The probe decodes real training prompts, so what it measures is the policy
+        # on the distribution it is being optimised for rather than on a fixture.
+        prompts=[dataset[i]["prompt"]
+                 for i in range(min(args.termination_probe_prompts, len(dataset)))],
+        stop_token_id=stop_token_id,
+    )
 
     callbacks = [monitor]
     if args.sanitise_generation_config or stop_token_id is not None:
