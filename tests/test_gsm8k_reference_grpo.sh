@@ -422,6 +422,116 @@ PYBOOL
 # it the suite fails on its own side effect.
 python3 -B "$WORK/boolflag.py" "$REF/train_grpo.py" || fail=1
 
+echo "[10] the termination monitor arms, latches, and leaves an un-armed run alone"
+# The failure this guards is invisible in every number the trainer prints: rollout
+# reward climbs while greedy termination goes to zero, and the cell ships a model
+# that cannot stop. 91039_g7 measured it by hand, concluded no learning rate did
+# both, and shipped its SFT plateau at 73.01 against an 83.2 population. So the
+# state machine is worth pinning directly -- especially the *un*-armed case, which
+# is the entire objection to just defaulting the flag to True.
+cat > "$WORK/monitor.py" <<'PYMON'
+import importlib.util, sys, types, json, os, tempfile
+spec = importlib.util.spec_from_file_location("train_grpo", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["train_grpo"] = m
+spec.loader.exec_module(m)
+
+bad = 0
+def chk(label, cond):
+    global bad
+    print(("  PASS " if cond else "  FAIL ") + label)
+    if not cond:
+        bad = 1
+
+Monitor = m._make_termination_monitor_class()
+
+class FakeTrainer:
+    def __init__(self):
+        self.mask_truncated_completions = False
+
+class FakeState:
+    def __init__(self):
+        self.global_step = 0
+
+def drive(mode, ratios, floor=0.90, bind=True):
+    """Feed a sequence of clipped_ratios through on_log, as the trainer would."""
+    out = tempfile.mkdtemp()
+    mon = Monitor(mode, floor)
+    tr = FakeTrainer()
+    if bind:
+        mon.bind(tr)
+    args = types.SimpleNamespace(output_dir=out)
+    st, ctl = FakeState(), types.SimpleNamespace()
+    for i, r in enumerate(ratios):
+        st.global_step = i + 1
+        mon.on_log(args, st, ctl, logs={"loss": 0.1, "completions/clipped_ratio": r})
+    mon.on_train_end(args, st, ctl)
+    return mon, tr, out
+
+# A base model that never learns to stop: clipped stays high the whole way. This is
+# the case the "masking zeroes most of the batch" comment is about, and the answer
+# has to be that nothing happens at all.
+mon, tr, out = drive(m.MASK_AUTO, [1.0, 0.99, 0.97, 0.95, 0.93])
+chk("never-terminating run never arms", mon.armed is False)
+chk("never-terminating run is never masked", tr.mask_truncated_completions is False)
+chk("...and reports no collapse", mon.engaged is False)
+
+# Learns to stop, then RL takes it away: the 91039_g7 shape.
+mon, tr, out = drive(m.MASK_AUTO, [0.9, 0.5, 0.05, 0.02, 0.40, 0.95, 1.0])
+chk("collapse arms then engages", mon.armed and mon.engaged)
+chk("masking is switched on", tr.mask_truncated_completions is True)
+chk("engaged at the first step below the floor", mon.engaged_step == 5)
+chk("best termination recorded", abs(mon.best - 0.98) < 1e-9)
+
+# Latching: once engaged it must not flap back off, and must not re-fire.
+tr.mask_truncated_completions = False
+st = FakeState(); st.global_step = 99
+mon.on_log(types.SimpleNamespace(output_dir=out), st, types.SimpleNamespace(),
+           logs={"completions/clipped_ratio": 0.99})
+chk("a second dip does not re-fire", mon.engaged_step == 5)
+
+# Explicit False must keep the old behaviour: warn, but never touch the loss.
+mon, tr, out = drive(False, [0.05, 0.02, 0.9])
+chk("explicit False still detects the collapse", mon.engaged is True)
+chk("explicit False never masks", tr.mask_truncated_completions is False)
+
+# Explicit True is on from step zero and needs no monitor to switch it; main()
+# passes it straight to GRPOConfig, so the monitor must not be what turns it on.
+chk("mask_at_start is True only for the boolean",
+    (m.parse_args(["--mask-truncated-completions", "True"]).mask_truncated_completions is True)
+    and (m.parse_args([]).mask_truncated_completions is not True))
+
+# The marker files are the whole diagnostic surface.
+mon, tr, out = drive(m.MASK_AUTO, [0.05, 0.02, 0.9])
+chk("writes a collapse marker", os.path.exists(os.path.join(out, "grpo_termination_collapse.json")))
+chk("writes a trace on every run", os.path.exists(os.path.join(out, "grpo_termination_trace.json")))
+d = json.load(open(os.path.join(out, "grpo_termination_trace.json")))
+chk("the trace records the step it engaged", d["masking_engaged_at_step"] == 3)
+chk("the trace records the mode", d["mode"] == m.MASK_AUTO)
+mon, tr, out = drive(m.MASK_AUTO, [1.0, 1.0])
+d = json.load(open(os.path.join(out, "grpo_termination_trace.json")))
+chk("a clean run says so", d["collapsed"] is False and d["armed"] is False)
+
+# An unbound monitor must not throw -- a wiring bug should be a loud log line and a
+# finished run, not a crash six hours in.
+mon, tr, out = drive(m.MASK_AUTO, [0.05, 0.02, 0.9], bind=False)
+chk("unbound monitor does not crash", mon.engaged is True)
+
+# The metric key is TRL's, and a rename must surface rather than silently disable
+# the monitor. Reading a log with no such key must leave everything untouched.
+mon = Monitor(m.MASK_AUTO, 0.9)
+mon.bind(FakeTrainer())
+st = FakeState(); st.global_step = 1
+mon.on_log(types.SimpleNamespace(output_dir=tempfile.mkdtemp()), st,
+           types.SimpleNamespace(), logs={"loss": 0.2})
+chk("a log without the key is inert", mon.trace == [] and mon.missing_warned is True)
+chk("the key TRL 0.27.2 emits is the one watched",
+    "completions/clipped_ratio" in Monitor.CLIPPED_KEYS)
+
+sys.exit(1 if bad else 0)
+PYMON
+python3 -B "$WORK/monitor.py" "$REF/train_grpo.py" || fail=1
+
 echo
 if [ "$fail" = 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
 exit $fail

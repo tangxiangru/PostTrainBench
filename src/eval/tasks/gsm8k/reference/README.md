@@ -67,6 +67,36 @@ same thing as a run that helped.
    in your tokenizer the script stops at second zero, because a template/model mismatch is
    this same defect wearing a different hat.
 
+4. **RL training the stop token back off again.** Defect 3 is about a stop token the
+   model cannot *reach*, and it is fixed before step zero on the decode side. This is the
+   same defect from the other end: the model can stop, and GRPO unlearns it. Nothing in
+   the objective prices termination -- `make_reward_fn` is binary on `grade_completion`,
+   which grades the trailing number and never asks whether the rollout ended -- so a
+   rollout that runs into the 512-token cap with the right number in its tail earns the
+   full reward and the full gradient, and "keep talking until a correct number goes past"
+   is a policy this reward pays for. 91039_g7 ran the ladder cleanly, found `1e-6` and
+   `3e-6` moved rollout reward *down* (-0.0266, -0.0203) and `1e-5` moved it up +0.3313,
+   then found that at `1e-5` greedy `stop_fraction` hit 0.0 and `mean_greedy_tokens` the
+   full 1024. It wrote `grpo_greedy_termination_failure.json`, concluded "the learning
+   rates that move rollout reward are exactly the learning rates that destroy greedy
+   termination -- there is no rate in the ladder that does both", abandoned RL and shipped
+   its SFT plateau at 73.01. The fourteen cells that shipped GRPO at `1e-5` *without*
+   collapsing averaged 83.2. It was not wrong about anything it measured; it was missing
+   the flag that breaks the tie, and the flag is hard to reach for because both of its
+   settings are wrong half the time. `--mask-truncated-completions False` leaves the hole
+   open; `True` closes it and opens another, because a base model that cannot stop yet has
+   nearly every rollout truncated, so masking zeroes most of the batch and the run makes no
+   progress while every number in the log looks healthy. The default is therefore neither:
+   `auto` keeps masking off until termination has actually been reached and latches it on
+   if it is then lost, which answers both objections at once and is a **no-op on a run that
+   never learns to stop** -- exactly the runs the second objection is about. `TerminationMonitor`
+   reads TRL's own `completions/clipped_ratio` (`grpo_trainer.py:1782`, the fraction of
+   rollouts whose last token is neither eos nor pad), so it costs no extra generation, and
+   it writes `grpo_termination_trace.json` next to the checkpoints on every run --
+   "termination held all the way through" is worth as much as the alarm is. Reward,
+   dataset, curriculum and learning rate are all still untouched: the only thing this
+   refuses to do is let the loss keep paying for completions that never terminated.
+
 ## Which model it trains
 
 **It has no default model, on purpose.** This benchmark is swept over four base models —
