@@ -1,0 +1,21 @@
+# Variable NAMES forwarded into the PostTrainBench agent sandbox by
+# src/run_task.sh. Values are read from the launching environment at submit
+# time; nothing secret is written here, and a name whose variable is unset in
+# that environment is skipped.
+#
+# These are not provider API keys. Prompt rule 9 forbids the agent from calling
+# an external LLM API with keys it finds in its environment; these variables are
+# the routing configuration for the harness that *runs* the agent, which is the
+# same category as ANTHROPIC_API_KEY in agents/claude/api_keys.json.
+CLAUDE_CODE_USE_VERTEX
+ANTHROPIC_VERTEX_PROJECT_ID
+ANTHROPIC_VERTEX_REGION
+CLOUD_ML_REGION
+ANTHROPIC_DEFAULT_OPUS_MODEL
+ANTHROPIC_DEFAULT_SONNET_MODEL
+ANTHROPIC_DEFAULT_HAIKU_MODEL
+VERTEX_REGION_CLAUDE_5_OPUS
+VERTEX_REGION_CLAUDE_5_SONNET
+VERTEX_REGION_CLAUDE_4_8_OPUS
+VERTEX_REGION_CLAUDE_4_6_OPUS
+VERTEX_REGION_CLAUDE_4_5_OPUS
