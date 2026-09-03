@@ -56,7 +56,17 @@ source src/commit_utils/set_env_vars.sh
 TMP_SUBDIR="${POST_TRAIN_BENCH_TMP_ROOT:-/tmp}/ptb_rescore_${SLURM_JOB_ID}"
 HF_MERGED="${TMP_SUBDIR}/merged_huggingface"
 TMP_HF_CACHE="/tmp/hf_cache_rescore"
-mkdir -p "${HF_MERGED}" "${TMP_SUBDIR}/upper_huggingface" "${TMP_SUBDIR}/fuse_workdir"
+# Bytecode goes to node-local scratch, not to the container root. Same 64 MiB
+# --writable-tmpfs overlay and the same reasoning as run_task.sh's SCORER_PYCACHE:
+# nothing in vllm_debug.sif is precompiled (uv installs --no-cache and does not
+# byte-compile; 24602 .py against 886 .pyc in dist-packages), one
+# `import transformers, torch, vllm` writes 41 MiB of .pyc, and ENOSPC part-way
+# through leaves a truncated .pyc that kills every later import. Deliberately NOT
+# under ${TMP_HF_CACHE}: that is the fuse-overlayfs merged mount, torn down at the
+# bottom of this file. Identity-bound rather than redirected, so the path is the
+# same inside and out and check_pycache.sh's message names a path that exists.
+PYCACHE="${TMP_SUBDIR}/pycache"
+mkdir -p "${HF_MERGED}" "${TMP_SUBDIR}/upper_huggingface" "${TMP_SUBDIR}/fuse_workdir" "${PYCACHE}"
 fuse-overlayfs -o "lowerdir=${HF_HOME},upperdir=${TMP_SUBDIR}/upper_huggingface,workdir=${TMP_SUBDIR}/fuse_workdir" "${HF_MERGED}" \
   || { echo "FATAL: overlay failed" >&2; exit 1; }
 
@@ -68,20 +78,39 @@ fuse-overlayfs -o "lowerdir=${HF_HOME},upperdir=${TMP_SUBDIR}/upper_huggingface,
 CACHE_BIND=()
 [ -n "${XDG_CACHE_HOME:-}" ] && [ -d "${XDG_CACHE_HOME}" ] && CACHE_BIND=(--bind "${XDG_CACHE_HOME}:${XDG_CACHE_HOME}")
 
+# Unset by default; the full argument for why it is not pinned on is in
+# src/run_task.sh next to POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND. Short version:
+# 89810_g5 lost 7 of 43 grader invocations to a CUDA illegal-memory-access until
+# it set TRITON_ATTN by hand, but nobody has measured what TRITON_ATTN costs per
+# read at these shapes, and a uniform throughput tax is the worse of the two
+# mistakes. A rescore is the cheapest place to measure that delta.
+ATTN_BACKEND_ENV=()
+[ -n "${POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND:-}" ] && \
+    ATTN_BACKEND_ENV=(--env "VLLM_ATTENTION_BACKEND=${POST_TRAIN_BENCH_VLLM_ATTENTION_BACKEND}")
+
+# check_pycache.sh runs inside this exec, ahead of python, so it sees the bind
+# list that is actually in force; a preflight exec of its own would carry a
+# second copy of the bind and could not notice this one losing it. $0 carries the
+# repo root and the rest are positional, so nothing in the single-quoted script
+# is expanded here and `exec` leaves python as the process whose rc is read.
 apptainer exec \
     --nv \
     --env HF_HOME="${TMP_HF_CACHE}" \
     --env HF_HUB_CACHE="${TMP_HF_CACHE}/hub" \
     --env HUGGINGFACE_HUB_CACHE="${TMP_HF_CACHE}/hub" \
     --env VLLM_API_KEY="inspectai" \
+    "${ATTN_BACKEND_ENV[@]}" \
     "${CACHE_BIND[@]}" \
     --writable-tmpfs \
     --bind "${EVAL_DIR}:${EVAL_DIR}" \
     --bind "${REPO_ROOT}:${REPO_ROOT}" \
     --bind "${HF_MERGED}:${TMP_HF_CACHE}" \
+    --bind "${PYCACHE}:${PYCACHE}" \
+    --env PYTHONPYCACHEPREFIX="${PYCACHE}" \
     --pwd "${REPO_ROOT}/src/eval/tasks/${TASK}" \
     "${POST_TRAIN_BENCH_CONTAINERS_DIR}/vllm_debug.sif" \
-    python evaluate.py \
+    bash -c 'bash "$0/src/utils/check_pycache.sh" || exit 1; exec python "$@"' \
+        "${REPO_ROOT}" evaluate.py \
         --model-path "${MODEL_PATH}" \
         --templates-dir ../../../../src/eval/templates \
         --limit -1 \

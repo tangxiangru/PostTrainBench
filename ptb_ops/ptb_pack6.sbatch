@@ -43,6 +43,30 @@ set -uo pipefail
 ARMS=("$@")
 [ "${#ARMS[@]}" -eq 6 ] || { echo "FATAL: need exactly 6 arm names, got ${#ARMS[@]}" >&2; exit 1; }
 
+# The arm -> GPU map below is `arm="${ARMS[$gpu]}"`: seat number *is* typed position, on
+# every pack, forever. That is the confound ptb_pack.sbatch was rewritten to remove, and it
+# is not hypothetical here -- job 82648 came out of a copy of this file. It cost a whole
+# day: a within-arm, within-job seat contrast of +17.31 +/- 6.22 pt survived every
+# stratification and was not real, because the outcome was bimodal and the failures
+# clustered on two seats. There is no way to tell that story apart from a seat effect
+# using packs whose map never varies, so this file stops rather than adding more of them.
+#
+# Not backported. ptb_pack.sbatch supersedes this file, draws the map under restricted
+# randomisation, records `seat_source`/`seat_draws` in the log, and is covered by
+# tests/test_pack_seat_map.sh. Copying 186 lines of that into a superseded script would
+# put an untested second implementation on a live submit path, which is a worse trade than
+# one refusal that names its replacement.
+if [ "${PTB_ALLOW_PACK6:-0}" != "1" ]; then
+    echo "FATAL: ptb_pack6.sbatch is superseded by ptb_pack.sbatch, which takes 1..8 arms" >&2
+    echo "       and draws the arm -> GPU map instead of pinning it to typed position." >&2
+    echo "       This file pins it, so 'which arm' and 'which seat' are the same variable" >&2
+    echo "       in anything it produces and neither can be estimated from the result." >&2
+    echo "       Use:  sbatch ptb_ops/ptb_pack.sbatch ${ARMS[*]}" >&2
+    echo "       Or set PTB_ALLOW_PACK6=1 to run anyway, knowingly confounded." >&2
+    exit 1
+fi
+echo "pack6_override=PTB_ALLOW_PACK6=1 seat_source=typed_position seat_confound=arm_equals_seat"
+
 TASK="${PTB_TASK:-gsm8k}"
 MODEL_TO_TRAIN="${PTB_MODEL:-Qwen/Qwen3-1.7B-Base}"
 NUM_HOURS="${PTB_NUM_HOURS:-1}"

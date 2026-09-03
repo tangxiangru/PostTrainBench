@@ -664,7 +664,17 @@ arm**, so roughly three blocked rounds.
   for deliberately measuring the null);
 - refuses a pack with no in-pack control (`PTB_CONTROL_ARM`, default `claude_autor_ctl`;
   `PTB_NO_CONTROL=1` overrides). The content hash skips `.git/` and `__pycache__/`: two
-  clones of one commit differ there while being the same arm.
+  clones of one commit differ there while being the same arm;
+- **draws** the arm → GPU-seat map from `(job id, pack composition)` rather than taking it
+  from argument order, and refuses any map in which a multi-seat arm holds only even cards,
+  only odd cards, or only one half of the chassis. Argument order was the map until now, and
+  the submit lines were identical every day: across the ten-hour pair `sn` held g0/g2/g4/g6
+  and `r2` held g1/g3/g5/g7 in every pack, so the arm effect, the NVLink neighbour, the
+  `sleep $((gpu*STAGGER))` start offset and the chassis position were one number. The draw is
+  deterministic, so a job id reproduces its own map, and the realised map is logged as
+  `seat gpu= arm= typed_pos=` plus a flat `seat_map g0=… g7=…`. `PTB_SEAT_MAP` pins a map by
+  hand and is held to the same rule; `PTB_ALLOW_SEAT_CONFOUND=1` runs a confounded pin anyway
+  and voids the between-arm contrast for that pack. Covered by `tests/test_pack_seat_map.sh`.
 
 # The one-hour board measures a decode flag, not a training recipe (2026-09-01)
 
