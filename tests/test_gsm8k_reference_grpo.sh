@@ -372,5 +372,56 @@ fi
 [ "$rc" = 0 ] || fail=1
 
 echo
+echo "[9] boolean flags accept the HuggingFace spelling as well as the argparse one"
+# argparse.BooleanOptionalAction takes `--bf16` and `--no-bf16` and nothing else.
+# HuggingFace TrainingArguments takes `--bf16 True`, which is the form an agent
+# writing a TRL command has actually read, and on the live 2026-09-03 campaign
+# cell 295f00fb spent two probe launches on
+#     train_grpo.py: error: unrecognized arguments: false
+# before logging "Fix flag and relaunch probes". Both spellings now work. The
+# last two cases matter as much as the rest: a boolean action that accepts
+# anything is not more permissive, it is silently wrong, and one that quietly
+# drops the value would pass every positive case here.
+cat > "$WORK/boolflag.py" <<'PYBOOL'
+import importlib.util, sys, io, contextlib
+spec = importlib.util.spec_from_file_location("tg", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+bad = 0
+def chk(argv, want, label):
+    global bad
+    got = m.parse_args(argv).bf16
+    ok = got == want
+    bad += not ok
+    print(f"  {'PASS' if ok else 'FAIL'} {label}: {' '.join(argv) or '(default)'} -> {got}")
+chk([], True, "default is unchanged")
+chk(["--bf16"], True, "bare flag")
+chk(["--no-bf16"], False, "bare negated")
+chk(["--bf16", "false"], False, "the live failure")
+chk(["--bf16", "True"], True, "HF capitalised")
+chk(["--bf16", "0"], False, "numeric")
+chk(["--no-bf16", "false"], True, "double negative")
+for flag, want in [("--use-vllm", False), ("--gradient-checkpointing", False),
+                   ("--log-completions", False), ("--save-only-model", False),
+                   ("--sanitise-generation-config", False),
+                   ("--mask-truncated-completions", True)]:
+    dest = flag[2:].replace("-", "_")
+    got = getattr(m.parse_args([flag, str(want).lower()]), dest)
+    bad += got != want
+    print(f"  {'PASS' if got == want else 'FAIL'} {flag} takes a value too -> {got}")
+err = io.StringIO()
+try:
+    with contextlib.redirect_stderr(err):
+        m.parse_args(["--bf16", "banana"])
+    print("  FAIL a non-boolean value was accepted"); bad += 1
+except SystemExit:
+    print("  PASS a non-boolean value is still rejected")
+sys.exit(1 if bad else 0)
+PYBOOL
+# -B, because this probe imports train_grpo.py from the reference directory and
+# checks [2]/[3] above assert that no __pycache__ is shipped beside it -- without
+# it the suite fails on its own side effect.
+python3 -B "$WORK/boolflag.py" "$REF/train_grpo.py" || fail=1
+
+echo
 if [ "$fail" = 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
 exit $fail
