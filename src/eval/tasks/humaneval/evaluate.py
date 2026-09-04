@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
         "--model-path",
         type=str,
         default="final_model",
-        help="Path to the Hugging Face model (directory or model identifier).",
+        help="Local checkpoint directory or the provided frozen base-model identifier.",
     )
     # this is a good limit for this task, just keep it like that (or use less in case you want faster tests)
     parser.add_argument(
@@ -93,9 +93,9 @@ def main() -> None:
     if args.limit == -1 and evidence.digest(contract) != FULL_SELECTION_SHA256:
         raise ValueError("full-task content differs from frozen selection fingerprint")
     task.dataset = MemoryDataset(samples, name=task.dataset.name, location=task.dataset.location)
-    model_path = Path(args.model_path).resolve(strict=True)
-    model_before = evidence.model_fingerprint(model_path)
+    model_path = evidence.resolve_local_model(args.model_path)
     formal = args.formal_provenance is not None
+    model_before = evidence.model_fingerprint(model_path, strict=formal)
     provenance_sha256 = None
     if formal:
         if (
@@ -195,7 +195,7 @@ def main() -> None:
     )
     if len(eval_out) != 1:
         raise ValueError("expected exactly one Inspect result")
-    if evidence.model_fingerprint(model_path) != model_before:
+    if evidence.model_fingerprint(model_path, strict=formal) != model_before:
         raise ValueError("model artifacts changed during evaluation")
     raw_path = Path(eval_out[0].location)
     if metrics_path:

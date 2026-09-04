@@ -67,7 +67,26 @@ def sync_directory(path):
         os.close(fd)
 
 
-def model_fingerprint(directory):
+def resolve_local_model(requested):
+    candidate = Path(requested)
+    if candidate.is_dir():
+        return candidate.resolve(strict=True)
+    snapshot = os.environ.get("PTB_BASE_MODEL_SNAPSHOT", "")
+    revision = os.environ.get("PTB_BASE_MODEL_REVISION", "")
+    if (
+        requested == os.environ.get("PTB_BASE_MODEL_ID")
+        and snapshot
+        and revision
+        and Path(snapshot).name == revision
+        and Path(snapshot).is_dir()
+    ):
+        return Path(snapshot).resolve(strict=True)
+    raise EvidenceError(
+        "use a local checkpoint or the provided frozen base-model snapshot; no unpinned download fallback"
+    )
+
+
+def model_fingerprint(directory, *, strict=True):
     """Bind the exact local model files; never import code from the model tree."""
     directory = Path(directory)
     require(
@@ -75,7 +94,10 @@ def model_fingerprint(directory):
     )
     files = []
     for path in sorted(directory.rglob("*")):
-        require(not path.is_symlink(), "symlink in final model is unsupported")
+        require(
+            not path.is_symlink() or (not strict and path.resolve().is_file()),
+            "symlink in final model is unsupported (development permits file links only)",
+        )
         if path.is_dir():
             continue
         require(path.is_file(), "nonregular model artifact")

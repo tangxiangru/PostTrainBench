@@ -94,7 +94,7 @@ mkdir "${JOB_DIR}/task"
 cp "src/eval/tasks/${EVALUATION_TASK}/${EVAL_SCRIPT}" "${JOB_DIR}/task/evaluate.py"
 # hv-patches (upstream PR #45): aime2025 now ships a local scorer next to
 # evaluate.py; carry those modules into the agent's task dir too.
-for _extra_module in score.py task.py runtime.py official_evidence.py; do
+for _extra_module in score.py task.py runtime.py official_evidence.py evidence_io.py data_provenance.json; do
     if [ -f "src/eval/tasks/${EVALUATION_TASK}/${_extra_module}" ]; then
         cp "src/eval/tasks/${EVALUATION_TASK}/${_extra_module}" "${JOB_DIR}/task"
     fi
@@ -631,6 +631,8 @@ run_evaluation() {
             --bind "${REPO_ROOT}/src/eval/ptb_python_sandbox.py:/opt/ptb-python/ptb_python_sandbox.py:ro"
             --bind "${PTB_PYTHON_BWRAP_PATH}:/opt/ptb-python/bwrap:ro"
         )
+    fi
+    if [ "$EVALUATION_TASK" = "humaneval" ] || [ "$EVALUATION_TASK" = "gpqamain" ]; then
         task_evidence_args=(--formal-provenance "${EVAL_DIR}/runtime_provenance.json" --attempt-number "$eval_num")
     fi
     mkdir -p \
@@ -677,8 +679,8 @@ run_evaluation() {
 
 ptb_metrics_ready() {
     [ -f "${EVAL_DIR}/metrics.json" ] || return 1
-    if [ "$EVALUATION_TASK" = "humaneval" ]; then
-        python3 "${REPO_ROOT}/src/eval/tasks/humaneval/official_evidence.py" --result-dir "$EVAL_DIR"
+    if [ "$EVALUATION_TASK" = "humaneval" ] || [ "$EVALUATION_TASK" = "gpqamain" ]; then
+        python3 "${REPO_ROOT}/src/eval/tasks/${EVALUATION_TASK}/official_evidence.py" --result-dir "$EVAL_DIR"
     else
         return 0
     fi
@@ -693,8 +695,8 @@ run_evaluation_with_retry() {
         if ptb_metrics_ready; then
             return 0
         fi
-        if [ "$EVALUATION_TASK" = "humaneval" ] && [ -e "${EVAL_DIR}/metrics.json" ]; then
-            echo "ERROR: Existing HumanEval metrics lack valid bound evidence; preserve for investigation, do not overwrite." >&2
+        if { [ "$EVALUATION_TASK" = "humaneval" ] || [ "$EVALUATION_TASK" = "gpqamain" ]; } && { [ -e "${EVAL_DIR}/metrics.json" ] || [ -L "${EVAL_DIR}/metrics.json" ]; }; then
+            echo "ERROR: Existing task metrics lack valid bound evidence; preserve for investigation, do not overwrite." >&2
             return 1
         fi
 

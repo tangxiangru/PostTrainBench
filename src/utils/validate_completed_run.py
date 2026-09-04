@@ -116,17 +116,25 @@ def validate(result_dir: Path, judge_profile: str, expected_task: str | None = N
 
     provenance_path = result_dir / "runtime_provenance.json"
     provenance = load_json(provenance_path, errors) if provenance_path.is_file() else None
+    if not isinstance(provenance, dict):
+        errors.append("runtime_provenance.json must be an object")
     if isinstance(provenance, dict):
         if "finalized_at" not in provenance:
             errors.append("runtime_provenance.json was not finalized")
         if provenance.get("judge_profile") != judge_profile:
             errors.append("runtime provenance judge profile mismatch")
-        actual_task = provenance.get("experiment", {}).get("task")
+        experiment = provenance.get("experiment")
+        actual_task = experiment.get("task") if isinstance(experiment, dict) else None
         if expected_task is not None and actual_task != expected_task:
             errors.append("runtime provenance task differs from expected task")
-        if actual_task == "humaneval" or expected_task == "humaneval":
+        strong_tasks = {"humaneval": "HumanEval", "gpqamain": "GPQA"}
+        strong_task = expected_task if expected_task in strong_tasks else actual_task
+        if isinstance(strong_task, str) and strong_task in strong_tasks:
             helper_path = (
-                Path(__file__).resolve().parent.parent / "eval/tasks/humaneval/official_evidence.py"
+                Path(__file__).resolve().parent.parent
+                / "eval/tasks"
+                / strong_task
+                / "official_evidence.py"
             )
             try:
                 spec = importlib.util.spec_from_file_location(
@@ -136,7 +144,7 @@ def validate(result_dir: Path, judge_profile: str, expected_task: str | None = N
                 spec.loader.exec_module(helper)
                 helper.validate_result(result_dir)
             except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
-                errors.append(f"HumanEval official evidence invalid: {exc}")
+                errors.append(f"{strong_tasks[strong_task]} official evidence invalid: {exc}")
 
     for filename, schema in JUDGEMENT_SCHEMAS.items():
         path = preferred_rerun(result_dir / filename)

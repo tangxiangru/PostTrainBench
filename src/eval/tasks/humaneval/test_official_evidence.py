@@ -419,6 +419,20 @@ def test_formal_detects_identity_and_archive_changes(formal, change):
         e.validate_result(result)
 
 
+def test_provided_frozen_base_alias_without_download(tmp_path, monkeypatch):
+    snapshot = tmp_path / "snapshots" / ("a" * 40)
+    snapshot.mkdir(parents=True)
+    monkeypatch.setenv("PTB_BASE_MODEL_ID", "invented/base-model")
+    monkeypatch.setenv("PTB_BASE_MODEL_REVISION", "a" * 40)
+    monkeypatch.setenv("PTB_BASE_MODEL_SNAPSHOT", str(snapshot))
+    assert e.resolve_local_model("invented/base-model") == snapshot.resolve()
+    with pytest.raises(e.EvidenceError):
+        e.resolve_local_model("unprovided/moving-model")
+    monkeypatch.setenv("PTB_BASE_MODEL_REVISION", "b" * 40)
+    with pytest.raises(e.EvidenceError):
+        e.resolve_local_model("invented/base-model")
+
+
 def test_model_fingerprint_rejects_symlink(tmp_path):
     model = tmp_path / "model"
     model.mkdir()
@@ -428,3 +442,12 @@ def test_model_fingerprint_rejects_symlink(tmp_path):
     (model / "model.safetensors").symlink_to(target)
     with pytest.raises(e.EvidenceError, match="symlink"):
         e.model_fingerprint(model)
+    assert (
+        e.model_fingerprint(model, strict=False)["files"][-1]["sha256"]
+        == e.hashlib.sha256(b"fake").hexdigest()
+    )
+    target.write_bytes(b"changed")
+    assert (
+        e.model_fingerprint(model, strict=False)["files"][-1]["sha256"]
+        == e.hashlib.sha256(b"changed").hexdigest()
+    )

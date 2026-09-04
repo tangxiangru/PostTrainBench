@@ -51,10 +51,28 @@ class ValidateCompletedRunTest(unittest.TestCase):
     def test_complete_official_result_passes(self) -> None:
         self.assertEqual(validate(self.result, "official"), [])
 
-    def test_expected_humaneval_cannot_fall_back_to_legacy_numeric_metrics(self) -> None:
+    def test_expected_humaneval_cannot_fall_back_to_legacy_numeric_metrics(
+        self,
+    ) -> None:
         errors = validate(self.result, "official", "humaneval")
         self.assertIn("runtime provenance task differs from expected task", errors)
-        self.assertTrue(any("HumanEval official evidence invalid" in error for error in errors))
+        self.assertTrue(
+            any("HumanEval official evidence invalid" in error for error in errors)
+        )
+
+    def test_expected_gpqa_cannot_fall_back_to_legacy_numeric_metrics(self) -> None:
+        errors = validate(self.result, "official", "gpqamain")
+        self.assertIn("runtime provenance task differs from expected task", errors)
+        self.assertTrue(
+            any("GPQA official evidence invalid" in error for error in errors)
+        )
+
+    def test_nonobject_provenance_cannot_skip_strict_task_checks(self) -> None:
+        (self.result / "runtime_provenance.json").write_text("[]")
+        self.assertIn(
+            "runtime_provenance.json must be an object",
+            validate(self.result, "official", "gpqamain"),
+        )
 
     def test_recovery_eval_log_satisfies_the_full_eval_evidence(self) -> None:
         (self.result / "final_eval_1.txt").unlink()
@@ -88,7 +106,9 @@ class ValidateCompletedRunTest(unittest.TestCase):
 
     def test_empty_model_weights_fail(self) -> None:
         (self.result / "final_model/model.safetensors").write_bytes(b"")
-        self.assertIn("final_model has no model weights", validate(self.result, "official"))
+        self.assertIn(
+            "final_model has no model weights", validate(self.result, "official")
+        )
 
     def test_unsafe_indexed_model_weight_fails(self) -> None:
         final_model = self.result / "final_model"
