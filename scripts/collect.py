@@ -38,11 +38,43 @@ Usage:
     python collect.py
     python collect.py --data-dir /path/to/results --output-dir /path/to/output
     python collect.py --min-run-id 100 --max-run-id 200
+
+--------------------------------------------------------------------------------
+READ THIS BEFORE QUOTING A NUMBER FROM THIS RESULTS TREE
+--------------------------------------------------------------------------------
+This script is the benchmark's official score, and on the local results tree
+(/rmeng_data/robtang/ptb-results) it has never produced one. As of 2026-09-04:
+241 cells carry a metrics.json and *zero* judgement files exist anywhere in the
+tree, because .env sets POST_TRAIN_BENCH_SKIP_JUDGES="1" and every cell was run
+with the judges off.
+
+So every PostTrainBench figure quoted from that tree — in a board markdown, a
+paper table, a memory note — is a raw metrics.json accuracy: a decode of
+final_model on the task, with no contamination verdict, no disallowed-base-model
+verdict, no API-usage verdict, and therefore no baseline fallback ever applied.
+That is a real number and it is not the benchmark's number. The gap is not
+hypothetical: an answer-key leak on the 89727/89809 board was found by
+ptb_ops/answer_key_audit.py, not by a judge, and it is exactly the kind of thing
+the contamination judge exists to catch.
+
+Two independent things block a judged score, and fixing either alone is not
+enough:
+  1. the judges cannot run — the ChatGPT subscription session they use is
+     revoked (token_revoked / 401 on codex 0.124.0 and 0.153.2 alike), and
+     src/judges/judge_lib.sh wants agents/codex_non_api/auth.json, which does not
+     exist in this checkout. Restoring it needs an interactive `codex logout &&
+     codex login` by the account owner; nothing headless can do it;
+  2. this script cannot aggregate a pack — every cell here is
+     gsm8k x Qwen3-1.7B-Base and walk_latest_runs returns one run per
+     (benchmark, model), so eight GPU seats of one job collapse to one slot. It
+     now refuses rather than dropping seven of eight silently.
+--------------------------------------------------------------------------------
 """
 import argparse
 import csv
 import glob
 import os
+import sys
 
 from utils import (
     get_results_dir,
@@ -285,6 +317,49 @@ def parse_args():
     return parser.parse_args()
 
 
+def warn_if_tree_is_unjudged(roots: list[str]) -> None:
+    """Say out loud when a results tree carries scores but no verdicts.
+
+    Not a refusal: collect_method already skips a method whose scored runs lack a
+    required verdict, so an unjudged tree produces no CSVs and cannot mislead
+    *this* script's output. It says it because of what happens outside this
+    script — the numbers people actually quote were read straight out of
+    metrics.json by ad-hoc tooling, and nothing there prints a word about judges.
+    Whoever runs collect.py is the person most likely to be about to quote one.
+    """
+    scored = judged = 0
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for cell in glob.glob(os.path.join(root, "*", "*")):
+            if not os.path.isdir(cell):
+                continue
+            if os.path.exists(os.path.join(cell, "metrics.json")):
+                scored += 1
+            if glob.glob(os.path.join(cell, "judgement_*.json")):
+                judged += 1
+    if scored and not judged:
+        print(
+            f"\nWARNING: {scored} scored cells and 0 judgement files under "
+            f"{', '.join(roots)}.\n"
+            f"         Nothing in this tree has been judged, so no accuracy in it "
+            f"is a PostTrainBench score —\n"
+            f"         it is a raw metrics.json decode with no contamination, "
+            f"base-model or API verdict\n"
+            f"         and no baseline fallback. Check "
+            f"POST_TRAIN_BENCH_SKIP_JUDGES in .env, and see the banner\n"
+            f"         at the top of this file for why the judges cannot "
+            f"currently run.\n",
+            file=sys.stderr,
+        )
+    elif scored and judged < scored:
+        print(
+            f"\nWARNING: {judged} of {scored} scored cells carry any judgement "
+            f"file.\n",
+            file=sys.stderr,
+        )
+
+
 def main():
     args = parse_args()
 
@@ -295,6 +370,8 @@ def main():
     # "just this dir".
     extra_dirs = [] if args.data_dir else get_extra_results_dirs()
     all_roots = [data_dir] + extra_dirs
+
+    warn_if_tree_is_unjudged(all_roots)
 
     # Load baseline data for fallback (hardcoded in baselines.json)
     baseline_data = get_baseline_fallback_data()

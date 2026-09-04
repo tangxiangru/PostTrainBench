@@ -336,6 +336,15 @@ def write_csv(
 # Walking result directories
 # ---------------------------------------------------------------------------
 
+# {benchmark}_{provider}_{model}_{run_id}[_g{seat}]
+#
+# The optional `_g<N>` tail is the GPU seat a pack job ran the cell on:
+# gsm8k_Qwen_Qwen3-1.7B-Base_89727_g3 is seat 3 of job 89727. Eight of those are
+# eight cells, not eight copies of one. The provider is parsed and dropped, which
+# is what the old four-field split did.
+RUN_DIR_RE = re.compile(r"^([^_]+)_([^_]+)_(.+)_(\d+)(?:_g(\d+))?$")
+
+
 def walk_latest_runs(
     method_path: str,
     min_run_id: int | None = None,
@@ -344,21 +353,30 @@ def walk_latest_runs(
     """
     Walk a method directory and return the latest run per (benchmark, model).
 
-    Returns {(benchmark, model): {"run_id": int, "path": str}}.
+    Returns {(benchmark, model): {"run_id": int, "path": str, "seat": str | None}}.
+
+    Raises ValueError on a directory name it cannot parse, and — deliberately —
+    on a method whose latest run has more than one GPU seat, because one slot per
+    (benchmark, model) cannot represent a pack. See the comment at the raise.
     """
     latest_runs = {}
 
-    for entry in os.listdir(method_path):
+    for entry in sorted(os.listdir(method_path)):
         entry_path = os.path.join(method_path, entry)
         if not os.path.isdir(entry_path):
             continue
+        if entry.startswith("_"):
+            continue  # _audit/ and friends are bookkeeping, not runs
 
-        try:
-            benchmark, _, model, run_id_str = entry.split("_")
-            run_id = int(run_id_str)
-        except ValueError:
-            print(entry)
-            raise ValueError(f"{entry}, {method_path}")
+        m = RUN_DIR_RE.match(entry)
+        if not m:
+            raise ValueError(
+                f"cannot parse run directory {entry!r} in {method_path}: expected "
+                f"{{benchmark}}_{{provider}}_{{model}}_{{run_id}} with an optional "
+                f"_g{{seat}} suffix"
+            )
+        benchmark, _provider, model, run_id_str, seat = m.groups()
+        run_id = int(run_id_str)
 
         if max_run_id is not None and run_id >= max_run_id:
             continue
@@ -366,8 +384,26 @@ def walk_latest_runs(
             continue
 
         key = (benchmark, model)
-        if key not in latest_runs or run_id > latest_runs[key]["run_id"]:
-            latest_runs[key] = {"run_id": run_id, "path": entry_path}
+        prev = latest_runs.get(key)
+        if prev is not None and run_id == prev["run_id"] and seat != prev["seat"]:
+            # Two GPU seats of the SAME job. That is not an older run being
+            # superseded, it is a pack: eight independent cells of one benchmark and
+            # one model, all equally current. This function returns one slot per
+            # (benchmark, model), so keeping "the latest" would drop seven of them
+            # and report the eighth as the method's result -- a 1/8 sample presented
+            # as the whole thing, with nothing in the output saying so. Refuse
+            # instead: giving the aggregation seat-aware semantics is a change to
+            # what a row means, not a parsing fix.
+            raise ValueError(
+                f"{method_path}: run {run_id} has multiple GPU seats for "
+                f"({benchmark}, {model}) -- at least _g{prev['seat']} and _g{seat}. "
+                f"walk_latest_runs returns one run per (benchmark, model), so it "
+                f"cannot aggregate a pack without silently discarding seats. Collect "
+                f"a seat-per-row board with ptb_ops/ instead, or extend the key here "
+                f"deliberately."
+            )
+        if prev is None or run_id > prev["run_id"]:
+            latest_runs[key] = {"run_id": run_id, "path": entry_path, "seat": seat}
 
     return latest_runs
 
@@ -375,6 +411,13 @@ def walk_latest_runs(
 # ---------------------------------------------------------------------------
 # Metrics loading
 # ---------------------------------------------------------------------------
+
+VOID_MARKER = "VOIDED_ANSWER_KEY.json"
+
+
+class VoidedCellError(RuntimeError):
+    """The cell read the answer key; its score is withdrawn, not merely missing."""
+
 
 def load_metrics(metrics_path: str) -> str:
     """Read the accuracy from metrics.json as a string.
@@ -384,7 +427,20 @@ def load_metrics(metrics_path: str) -> str:
     TypeError if 'accuracy' is not numeric. There is no silent fallback —
     callers that want a baseline fallback for missing runs must guard the
     call themselves.
+
+    Raises VoidedCellError if the run directory carries VOID_MARKER. That marker
+    is written by ptb_ops/void_cells.py from the ptb_ops/answer_key_audit.py
+    manifest, and it means the cell read the shipped-recipe corpus for the task it
+    is graded on. The check is here and not only in the callers because the void
+    must survive someone restoring metrics.json by hand: the marker is the
+    statement, the rename is only the enforcement.
     """
+    marker = os.path.join(os.path.dirname(metrics_path), VOID_MARKER)
+    if os.path.exists(marker):
+        raise VoidedCellError(
+            f"{metrics_path}: cell is voided for answer-key contamination — "
+            f"see {marker}"
+        )
     if not os.path.exists(metrics_path):
         raise FileNotFoundError(f"metrics.json not found: {metrics_path}")
     with open(metrics_path, "r") as f:

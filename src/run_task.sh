@@ -987,7 +987,12 @@ for JUDGE_NAME in "${ALL_JUDGES[@]}"; do
 
     JUDGE_PROMPT=$(build_judge_prompt "${JUDGE_NAME}" "${EVALUATION_TASK}" "${MODEL_TO_TRAIN}" "${AGENT}" "${AGENT_CONFIG}")
 
-    with_huggingface_overlay run_judge_exec "${JOB_DIR}" "${JOB_TMP}" "${EVAL_DIR}/judge_output_${JUDGE_OUTPUT_ID}.json" "${JUDGE_PROMPT}"
+    # run_judge_exec now returns codex's own status instead of tee's, so a dead
+    # subscription is visible here. Swallowed deliberately and at the call site:
+    # this is the inline path, the agent's 10h of work is already done, and a
+    # failing judge must not cost it its evaluation.
+    with_huggingface_overlay run_judge_exec "${JOB_DIR}" "${JOB_TMP}" "${EVAL_DIR}/judge_output_${JUDGE_OUTPUT_ID}.json" "${JUDGE_PROMPT}" \
+        || echo "WARNING: ${JUDGE_LABEL} exited non-zero; continuing without its verdict" >&2
 
     # missing_fatal=0: a judge that produces no verdict warns and moves on. The
     # agent's 10h of work is already done, so it must still be evaluated; the

@@ -55,9 +55,17 @@ load_judge_conf() {
     # makes run_judge_exec npm-install exactly that @openai/codex release into
     # the sandbox home and run it instead.
     JUDGE_CODEX_VERSION=""
+    # The boolean verdict fields this judge's prompt asks for. collect_judge_output
+    # validates the sandbox judgement against them before installing it, so a judge
+    # that declares nothing cannot be checked -- hence required, not optional.
+    JUDGE_SCHEMA_FIELDS=""
     source "$conf"
     if [ -z "$JUDGE_LABEL" ] || [ -z "$JUDGE_OUTPUT_ID" ] || [ -z "$JUDGE_PROMPT_FILE" ]; then
         echo "ERROR: $conf must set JUDGE_LABEL, JUDGE_OUTPUT_ID and JUDGE_PROMPT_FILE" >&2
+        return 1
+    fi
+    if [ -z "$JUDGE_SCHEMA_FIELDS" ]; then
+        echo "ERROR: $conf must set JUDGE_SCHEMA_FIELDS (the boolean verdict fields its prompt requests)" >&2
         return 1
     fi
 }
@@ -103,9 +111,36 @@ setup_judge_codex_auth() {
     cp -r "$JUDGES_REPO_ROOT/containers/other_home_data/.codex" "$job_dir/"
     # Touch a placeholder so apptainer has something to bind onto inside .codex/.
     : > "$job_dir/.codex/auth.json"
-    if ! grep -q "forced_login_method" "$job_dir/.codex/config.toml" 2>/dev/null; then
-        printf '\nforced_login_method = "chatgpt"\n' >> "$job_dir/.codex/config.toml"
+    # TOML is section-scoped: appending to the end of the file puts the key under
+    # whatever table happens to be last (here `[shell_environment_policy]`), where
+    # codex never looks for it, so the setting reads as present and does nothing.
+    # It has to go in the top-level table, i.e. before the first `[section]` line.
+    local cfg="$job_dir/.codex/config.toml"
+    if ! judge_toml_has_root_key "$cfg" forced_login_method; then
+        {   echo 'forced_login_method = "chatgpt"'
+            cat "$cfg" 2>/dev/null
+        } > "${cfg}.new" && mv "${cfg}.new" "$cfg"
     fi
+    if ! judge_toml_has_root_key "$cfg" forced_login_method; then
+        echo "ERROR: forced_login_method is not in the top-level table of $cfg" >&2
+        return 1
+    fi
+}
+
+# judge_toml_has_root_key <config.toml> <key>
+# True when <key> is set in the top-level table, i.e. above the first [section].
+# The distinction is the whole point: a key below a [section] header belongs to
+# that section and is not the setting anyone meant to write.
+judge_toml_has_root_key() {
+    local cfg="$1" key="$2"
+    [ -f "$cfg" ] || return 1
+    # `exit N` inside a rule still runs END, whose own exit would override it, so
+    # the answer travels in a flag rather than in a status.
+    awk -v k="$key" '
+        /^[[:space:]]*\[/ { exit }
+        $0 ~ "^[[:space:]]*" k "[[:space:]]*=" { found = 1; exit }
+        END { exit(found ? 0 : 1) }
+    ' "$cfg"
 }
 
 # build_judge_prompt <judge_name> <benchmark_id> <model_hf> <agent> <agent_config>
@@ -151,6 +186,12 @@ run_judge_exec() {
         codex_bin="/home/ben/${pin_prefix}/bin/codex"
     fi
 
+    # `| tee` makes tee's status the pipeline's, and tee always succeeds. Without
+    # PIPESTATUS a codex that 401s, hits a usage limit or crashes returns 0 here,
+    # and the only trace of it is whatever half-written judgement.json the sandbox
+    # kept -- which the caller then stores as a verdict. The status is read here
+    # rather than relying on `set -o pipefail` in the caller, because run_task.sh
+    # and run_judges.sh are different shells with different options.
     apptainer exec \
         --containall \
         "${JUDGE_EXTRA_APPTAINER_ARGS[@]}" \
@@ -165,6 +206,16 @@ run_judge_exec() {
         --writable-tmpfs \
         "${POST_TRAIN_BENCH_CONTAINERS_DIR}/${JUDGE_CONTAINER}" \
         "$codex_bin" --search -a never exec --json -c model_reasoning_summary=detailed -c model_reasoning_effort="${JUDGE_REASONING_EFFORT}" --skip-git-repo-check --yolo --model "${JUDGE_MODEL}" "$prompt" 2>&1 | tee "$output_json"
+    local rc="${PIPESTATUS[0]}"
+    if [ "$rc" -ne 0 ]; then
+        echo "ERROR: ${JUDGE_LABEL}: codex exited ${rc} (trace: ${output_json})" >&2
+        # Common enough to name: a revoked ChatGPT session is the same exit code as
+        # any other failure, and the message is only in the trace.
+        if grep -qE 'token_revoked|refresh_token_invalidated|401 Unauthorized|Unauthorized' "$output_json" 2>/dev/null; then
+            echo "       the trace says the subscription session is dead — re-run \`codex login\` and refresh agents/codex_non_api/auth.json" >&2
+        fi
+        return "$rc"
+    fi
 }
 
 # collect_judge_output <job_dir> <out_dir> <name_suffix> <missing_fatal>
@@ -185,13 +236,29 @@ collect_judge_output() {
 
     python "$JUDGES_REPO_ROOT/src/trace_parsing/parse_trace.py" --agent codex "$out_dir/${out_base}.json" -o "$out_dir/${out_base}.txt"
 
-    if [ -f "$job_dir/task/judgement.json" ]; then
-        cp "$job_dir/task/judgement.json" "$judgement"
-        echo "  ${JUDGE_LABEL} judgement: $(cat "$judgement")"
-    elif [ "$missing_fatal" = "1" ]; then
-        echo "ERROR: judgement.json not created by ${JUDGE_LABEL} (see $out_dir/${out_base}.txt)" >&2
-        return 1
-    else
+    if [ ! -f "$job_dir/task/judgement.json" ]; then
+        if [ "$missing_fatal" = "1" ]; then
+            echo "ERROR: judgement.json not created by ${JUDGE_LABEL} (see $out_dir/${out_base}.txt)" >&2
+            return 1
+        fi
         echo "WARNING: judgement.json not created by ${JUDGE_LABEL} (see $out_dir/${out_base}.txt); continuing — a missing inline verdict never aborts the task run" >&2
+        return 0
     fi
+
+    # A file existing is not a verdict existing. Validate before installing, and
+    # install by rename, so `judgement_*.json` on disk always means "a judge
+    # returned this". A missing verdict is a visible hole; a malformed one that
+    # got stored is a number in a table.
+    if ! python "$JUDGES_DIR/validate_judgement.py" "$job_dir/task/judgement.json" \
+            --fields "$JUDGE_SCHEMA_FIELDS" >/dev/null; then
+        local rejected="$out_dir/judgement_${JUDGE_OUTPUT_ID}${suffix}.json.REJECTED"
+        cp "$job_dir/task/judgement.json" "$rejected"
+        echo "ERROR: ${JUDGE_LABEL} produced a judgement.json that is not a usable verdict; kept as $rejected" >&2
+        [ "$missing_fatal" = "1" ] && return 1
+        echo "WARNING: continuing without a ${JUDGE_LABEL} verdict — a bad inline verdict never aborts the task run" >&2
+        return 0
+    fi
+
+    cp "$job_dir/task/judgement.json" "${judgement}.tmp" && mv "${judgement}.tmp" "$judgement"
+    echo "  ${JUDGE_LABEL} judgement: $(cat "$judgement")"
 }

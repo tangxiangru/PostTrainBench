@@ -15,9 +15,9 @@
 #      scripts/collect.py errors out if it ever flags)
 #   4. general_judge            -> judgement_general_rerun.json
 #      (separate `general_anomaly` schema; GPT-5.6-Terra unknown-unknowns
-#      sweep on codex 0.144.5 — archival, but when it flags,
-#      scripts/collect.py finishes its collection pass without writing any
-#      files and errors out listing the flagged runs)
+#      sweep on codex 0.144.5 — archival and unconsumed: scripts/collect.py
+#      never reads this file, so a flag here has no effect on anything and
+#      has to be found by reading the judgements)
 #
 # All outputs are always saved with the _rerun suffix so original judge
 # outputs produced by src/run_task.sh are preserved.
@@ -29,7 +29,10 @@
 #              e.g. --judges data_contamination_judge
 #                   --judges api_usage_judge
 
+# pipefail: every judge invocation is `apptainer ... | tee`, and tee always
+# succeeds, so without it a codex that dies on a revoked session exits 0 here.
 set -e
+set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/judge_lib.sh"
@@ -94,10 +97,24 @@ fi
 source "$JUDGES_REPO_ROOT/src/commit_utils/set_env_vars.sh"
 
 # Parse result directory to get benchmark and model
-# Format: {benchmark}_{provider}_{model}_{cluster_id}
+# Format: {benchmark}_{provider}_{model}_{cluster_id}[_g{gpu_seat}]
+#
+# The `_g<N>` tail is the GPU seat a pack job ran the cell on, e.g.
+# gsm8k_Qwen_Qwen3-1.7B-Base_89727_g3 is seat 3 of job 89727. It has to come off
+# before the `_[0-9]+$` anchor below, or that substitution simply does not match
+# and sed passes the input through unchanged — MODEL_PART becomes the whole
+# directory name and the judge is told the model under test is
+# "gsm8k/Qwen_Qwen3-1.7B-Base_89727_g3". No error, just a judge reasoning about a
+# model that does not exist.
 DIRNAME=$(basename "$RESULT_DIR")
-BENCHMARK=$(echo "$DIRNAME" | sed -E 's/^([^_]+)_.*/\1/')
-MODEL_PART=$(echo "$DIRNAME" | sed -E 's/^[^_]+_(.*)_[0-9]+$/\1/')
+DIRNAME_NOSEAT=$(echo "$DIRNAME" | sed -E 's/_g[0-9]+$//')
+BENCHMARK=$(echo "$DIRNAME_NOSEAT" | sed -E 's/^([^_]+)_.*/\1/')
+MODEL_PART=$(echo "$DIRNAME_NOSEAT" | sed -E 's/^[^_]+_(.*)_[0-9]+$/\1/')
+if [ "$MODEL_PART" = "$DIRNAME_NOSEAT" ]; then
+    echo "Error: cannot parse a model out of '$DIRNAME'" >&2
+    echo "       expected {benchmark}_{provider}_{model}_{cluster_id}[_g{seat}]" >&2
+    exit 1
+fi
 MODEL_HF=$(echo "$MODEL_PART" | sed 's/_/\//')
 
 # Parse the parent (method) directory to get the agent + its harness model.
@@ -135,15 +152,6 @@ prepare_judge_sandbox "$JOB_DIR" "$BENCHMARK" "$RESULT_DIR/final_model/config.js
 # Set up codex config + ChatGPT Pro subscription auth (JUDGE_CODEX_AUTH_SRC).
 setup_judge_codex_auth "$JOB_DIR"
 
-# Remove any pre-existing per-judge output files in the result dir for the
-# judges we are about to rerun, so stale values from earlier runs can't be
-# confused with fresh output when a CLI fails. Leave the skipped judges'
-# files alone.
-for JUDGE_NAME in "${JUDGES[@]}"; do
-    load_judge_conf "$JUDGE_NAME"
-    rm -f "$RESULT_DIR/judgement_${JUDGE_OUTPUT_ID}_rerun.json"
-done
-
 JUDGE_EXTRA_APPTAINER_ARGS=()
 
 for JUDGE_NAME in "${JUDGES[@]}"; do
@@ -153,6 +161,15 @@ for JUDGE_NAME in "${JUDGES[@]}"; do
     echo "========================================="
     echo "=== ${JUDGE_LABEL} ==="
     echo "========================================="
+
+    # Drop this judge's previous verdict immediately before running it, not up
+    # front for the whole set. Deleting all of them first means that when judge 2
+    # of 4 dies, judges 3 and 4 have lost their old verdicts without producing new
+    # ones -- one failure silently erases work the failure had nothing to do with.
+    # Now a judge only ever destroys its own prior output, and only once it is
+    # about to replace it.
+    rm -f "$RESULT_DIR/judgement_${JUDGE_OUTPUT_ID}_rerun.json" \
+          "$RESULT_DIR/judgement_${JUDGE_OUTPUT_ID}_rerun.json.REJECTED"
 
     # Clean judgement file so each judge starts fresh
     rm -f "$JOB_DIR/task/judgement.json"

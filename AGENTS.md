@@ -258,6 +258,22 @@ Reruns: `src/judges/rerun/` holds the batch-rerun pipeline. Rerun outputs
 always carry a `_rerun` suffix so original judge files produced during `run_task.sh` are
 preserved.
 
+**No number on the local results tree is a judged number.** As of 2026-09-04
+`/rmeng_data/robtang/ptb-results` holds 241 cells with a `metrics.json` and **zero**
+judgement files of any kind: `.env` sets `POST_TRAIN_BENCH_SKIP_JUDGES="1"` and every cell
+ran with the judges off. So every PostTrainBench figure quoted from that tree — board
+markdown, paper table, memory note — is a raw `metrics.json` accuracy with no contamination,
+disallowed-base-model or API verdict, and no baseline fallback ever applied. It is a real
+number; it is not the benchmark's number, and the distinction is not academic — the
+answer-key leak on the 89727/89809 board was caught by `ptb_ops/answer_key_audit.py`, not by
+the contamination judge that exists for exactly that. `scripts/collect.py` prints this on
+every run and refuses to write CSVs for an unjudged method. Two independent blockers, and
+fixing either alone is not enough: the judges' ChatGPT subscription session is revoked
+(`token_revoked`/401; `agents/codex_non_api/auth.json` is absent and only an interactive
+`codex login` by the account owner can restore it), and `walk_latest_runs` returns one run
+per `(benchmark, model)`, which cannot represent eight GPU seats of one pack job — it now
+refuses instead of silently keeping one seat in eight.
+
 The judge tooling itself lives in:
 - `src/judges/judge_lib.sh` — shared bash helpers used by both `run_task.sh` and
   `run_judges.sh` (sandbox prep, codex invocation, output collection)

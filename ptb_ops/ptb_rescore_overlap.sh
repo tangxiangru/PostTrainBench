@@ -33,6 +33,13 @@ MODEL_PATH="${EVAL_DIR}/final_model"
 echo "node=$(hostname) host_job=${SLURM_JOB_ID:-none} gpu=${GPU} tag=${TAG} start=$(date --iso-8601=seconds)"
 echo "eval_dir=${EVAL_DIR}"
 [ -f "${MODEL_PATH}/config.json" ] || { echo "FATAL: no config.json under ${MODEL_PATH}" >&2; exit 1; }
+# This script overwrites metrics.json in place, so on a voided cell it would undo the
+# quarantine that void_cells.py put there. Rescoring cannot clear answer-key
+# contamination anyway: the weights were trained on the leak.
+if [ -f "${EVAL_DIR}/VOIDED_ANSWER_KEY.json" ]; then
+    echo "FATAL: ${EVAL_DIR} is voided for answer-key contamination -- refusing" >&2
+    exit 1
+fi
 
 export PATH="/rmeng_data/robtang/tools/apt-root/usr/bin:$PATH"
 export LD_LIBRARY_PATH="/rmeng_data/robtang/tools/apt-root/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

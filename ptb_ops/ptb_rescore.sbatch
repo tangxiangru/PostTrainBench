@@ -69,6 +69,14 @@ echo "node=$(hostname) job=$SLURM_JOB_ID start=$(date --iso-8601=seconds)"
 echo "eval_dir=${EVAL_DIR}"
 echo "task=${TASK}"
 [ -f "${MODEL_PATH}/config.json" ] || { echo "FATAL: no config.json under ${MODEL_PATH}" >&2; exit 1; }
+# A voided cell read the answer key. Rescoring writes metrics.json back, which is
+# exactly the file void_cells.py renamed away -- the void would survive in the marker
+# but the tree would stop matching the manifest, and the next reader sees a score.
+if [ -f "${EVAL_DIR}/VOIDED_ANSWER_KEY.json" ]; then
+    echo "FATAL: ${EVAL_DIR} is voided for answer-key contamination -- rescoring the" >&2
+    echo "       same weights cannot clear it; the training data is what is tainted." >&2
+    exit 1
+fi
 
 export PATH="/rmeng_data/robtang/tools/apt-root/usr/bin:$PATH"
 export LD_LIBRARY_PATH="/rmeng_data/robtang/tools/apt-root/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

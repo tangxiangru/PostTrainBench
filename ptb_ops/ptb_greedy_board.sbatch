@@ -124,6 +124,11 @@ declare -a WORK=()
 if [ "$#" -gt 0 ]; then
     for d in "$@"; do
         d="${d%/}"
+        # Named by hand, so say why it is being dropped rather than dropping it quietly.
+        if [ -f "${d}/VOIDED_ANSWER_KEY.json" ]; then
+            echo "SKIP ${d}: voided for answer-key contamination" >&2
+            continue
+        fi
         src="${d}/final_model"; [ -f "${src}/config.json" ] || src="${d}"
         WORK+=("${src}:::$(basename "$(dirname "$d")")/$(basename "$d")")
     done
@@ -131,6 +136,12 @@ else
     for d in "${RESULTS_ROOT}"/*/*/; do
         d="${d%/}"
         [ -f "${d}/final_model/config.json" ] || continue
+        # A voided cell has no metrics.json either (void_cells.py renames it), so the
+        # next test would already skip it -- but by accident, and silently.
+        if [ -f "${d}/VOIDED_ANSWER_KEY.json" ]; then
+            echo "SKIP ${d}: voided for answer-key contamination" >&2
+            continue
+        fi
         # metrics.json is the marker of a cell that was actually graded. Its absence is
         # what distinguishes 82165/82166, which are handled elsewhere.
         [ -f "${d}/metrics.json" ] || continue
