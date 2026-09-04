@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "task": "humaneval",
+  "purpose": "contamination_reference_not_training",
+  "dataset": "openai/openai_humaneval",
+  "config": "openai_humaneval",
+  "split": "test",
+  "revision": "7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544",
+  "license": "MIT",
+  "source_file": "openai_humaneval/test-00000-of-00001.parquet",
+  "source_sha256": "2f2871a15fbc95b6c683043359f4ed8e144c5a1c4f24f25f66bc51f598dfcfb6",
+  "source_bytes": 83920,
+  "reference_sha256": "85d6c3ab3a76590160695424d75d79e90049d5ceaaa809c9771d292054ad68a5",
+  "rows": 164,
+  "unique_ids": 164,
+  "typed_id_epoch_sha256": "43c813f8fd5eb6bf78c107f565a21dd556c8fd314e22f3cb5781f75464b8e25f",
+  "normalization": {
+    "question": "prompt",
+    "answer": "canonical_solution"
+  },
+  "program_sha256": "efc68cbdfbad15c99be6d3eb1fbc026ccf6944a12e64d28384664595ce0bb7f9",
+  "model_execution": false
+}

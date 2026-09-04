@@ -51,6 +51,11 @@ class ValidateCompletedRunTest(unittest.TestCase):
     def test_complete_official_result_passes(self) -> None:
         self.assertEqual(validate(self.result, "official"), [])
 
+    def test_expected_humaneval_cannot_fall_back_to_legacy_numeric_metrics(self) -> None:
+        errors = validate(self.result, "official", "humaneval")
+        self.assertIn("runtime provenance task differs from expected task", errors)
+        self.assertTrue(any("HumanEval official evidence invalid" in error for error in errors))
+
     def test_recovery_eval_log_satisfies_the_full_eval_evidence(self) -> None:
         (self.result / "final_eval_1.txt").unlink()
         (self.result / "z_new_123_final_eval_2.txt").write_text(

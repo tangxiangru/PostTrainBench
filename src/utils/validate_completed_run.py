@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 from pathlib import Path
 from typing import Any
-
 
 JUDGEMENT_SCHEMAS = {
     "judgement_gpt5_4.json": {
@@ -47,7 +47,7 @@ def preferred_rerun(path: Path) -> Path:
     return path
 
 
-def validate(result_dir: Path, judge_profile: str) -> list[str]:
+def validate(result_dir: Path, judge_profile: str, expected_task: str | None = None) -> list[str]:
     errors: list[str] = []
     for relative in (
         "prompt.txt",
@@ -89,10 +89,16 @@ def validate(result_dir: Path, judge_profile: str) -> list[str]:
             errors.append("final_model weight index has no weight_map")
         else:
             for name in weight_map.values():
-                if not isinstance(name, str) or Path(name).is_absolute() or ".." in Path(name).parts:
+                if (
+                    not isinstance(name, str)
+                    or Path(name).is_absolute()
+                    or ".." in Path(name).parts
+                ):
                     errors.append(f"final_model weight index has unsafe shard path: {name!r}")
                 elif not (final_model / name).is_file() or (final_model / name).stat().st_size == 0:
-                    errors.append(f"final_model weight index references missing or empty shard: {name}")
+                    errors.append(
+                        f"final_model weight index references missing or empty shard: {name}"
+                    )
     elif not any(path.stat().st_size for path in final_model.glob("*.safetensors")) and not any(
         path.stat().st_size for path in final_model.glob("pytorch_model*.bin")
     ):
@@ -102,7 +108,10 @@ def validate(result_dir: Path, judge_profile: str) -> list[str]:
     metrics = load_json(metrics_path, errors) if metrics_path.is_file() else None
     if not isinstance(metrics, dict) or not metrics:
         errors.append("metrics.json must be a non-empty object")
-    elif not any(isinstance(value, (int, float)) and not isinstance(value, bool) for value in metrics.values()):
+    elif not any(
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        for value in metrics.values()
+    ):
         errors.append("metrics.json has no numeric metric")
 
     provenance_path = result_dir / "runtime_provenance.json"
@@ -112,6 +121,22 @@ def validate(result_dir: Path, judge_profile: str) -> list[str]:
             errors.append("runtime_provenance.json was not finalized")
         if provenance.get("judge_profile") != judge_profile:
             errors.append("runtime provenance judge profile mismatch")
+        actual_task = provenance.get("experiment", {}).get("task")
+        if expected_task is not None and actual_task != expected_task:
+            errors.append("runtime provenance task differs from expected task")
+        if actual_task == "humaneval" or expected_task == "humaneval":
+            helper_path = (
+                Path(__file__).resolve().parent.parent / "eval/tasks/humaneval/official_evidence.py"
+            )
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    "ptb_humaneval_official_evidence", helper_path
+                )
+                helper = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(helper)
+                helper.validate_result(result_dir)
+            except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+                errors.append(f"HumanEval official evidence invalid: {exc}")
 
     for filename, schema in JUDGEMENT_SCHEMAS.items():
         path = preferred_rerun(result_dir / filename)
@@ -139,8 +164,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("result_dir", type=Path)
     parser.add_argument("--judge-profile", required=True)
+    parser.add_argument("--expected-task")
     args = parser.parse_args()
-    errors = validate(args.result_dir, args.judge_profile)
+    errors = validate(args.result_dir, args.judge_profile, args.expected_task)
     if errors:
         for error in errors:
             print(f"COMPLETION ERROR: {error}")

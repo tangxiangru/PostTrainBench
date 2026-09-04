@@ -47,6 +47,17 @@ fi
 
 export EVAL_DIR="${POST_TRAIN_BENCH_RESULTS_DIR}/${AGENT}_${AGENT_CONFIG_SAFE}_${NUM_HOURS}h${GPU_SUFFIX}${POST_TRAIN_BENCH_EXPERIMENT_NAME}/${EVALUATION_TASK}_${RESULT_PREFIX_SAFE}_${CLUSTER_ID}"
 
+# HumanEval's generated code never uses Inspect's same-user local backend.
+# The site supplies this public executable; its exact bytes are checked again
+# inside both scientist and formal evaluator by the frozen task runtime.
+if [ "$EVALUATION_TASK" = "humaneval" ]; then
+    export PTB_PYTHON_BWRAP_PATH="${POST_TRAIN_BENCH_PYTHON_BWRAP:?HumanEval requires POST_TRAIN_BENCH_PYTHON_BWRAP}"
+    if [ ! -f "$PTB_PYTHON_BWRAP_PATH" ]; then
+        echo "ERROR: HumanEval isolated Python executable is unavailable" >&2
+        exit 1
+    fi
+fi
+
 mkdir -p ${EVAL_DIR}
 
 exec 1>${EVAL_DIR}/output.log
@@ -83,7 +94,7 @@ mkdir "${JOB_DIR}/task"
 cp "src/eval/tasks/${EVALUATION_TASK}/${EVAL_SCRIPT}" "${JOB_DIR}/task/evaluate.py"
 # hv-patches (upstream PR #45): aime2025 now ships a local scorer next to
 # evaluate.py; carry those modules into the agent's task dir too.
-for _extra_module in score.py task.py; do
+for _extra_module in score.py task.py runtime.py official_evidence.py; do
     if [ -f "src/eval/tasks/${EVALUATION_TASK}/${_extra_module}" ]; then
         cp "src/eval/tasks/${EVALUATION_TASK}/${_extra_module}" "${JOB_DIR}/task"
     fi
@@ -324,6 +335,16 @@ solve_task() {
         echo "Extra sandbox binds: ${POST_TRAIN_BENCH_EXTRA_BINDS}"
     fi
     # --- extra binds (end) ---
+    PYTHON_SANDBOX_ARGS=()
+    if [ "$EVALUATION_TASK" = "humaneval" ]; then
+        _python_image_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["container"]["sha256"])' "${EVAL_DIR}/runtime_provenance.json")"
+        PYTHON_SANDBOX_ARGS=(
+            --bind "$(pwd)/src/eval/ptb_python_sandbox.py:/opt/ptb-python/ptb_python_sandbox.py:ro"
+            --bind "${PTB_PYTHON_BWRAP_PATH}:/opt/ptb-python/bwrap:ro"
+            --env "PTB_PYTHON_SOURCE_IMAGE=${POST_TRAIN_BENCH_CONTAINER_NAME}.sif"
+            --env "PTB_PYTHON_SOURCE_IMAGE_SHA256=${_python_image_sha}"
+        )
+    fi
     timeout --signal=TERM --kill-after=30s "$((NUM_HOURS * 60 + 5))m" \
     apptainer exec \
         --nv \
@@ -349,6 +370,7 @@ solve_task() {
         --bind "${JOB_TMP}:/tmp" \
         --bind "${HF_MERGED}:${HF_HOME_NEW}" \
         "${EXTRA_BIND_ARGS[@]}" \
+        "${PYTHON_SANDBOX_ARGS[@]}" \
         "${AGENT_AUTH_BIND[@]}" \
         "${CURSOR_AUTH_BIND[@]}" \
         "${GROK_AUTH_BIND[@]}" \
@@ -602,6 +624,15 @@ run_evaluation() {
     local eval_num="$2"
     local eval_home="${JOB_TMP}/eval-home"
     local eval_cache="${eval_home}/.cache"
+    local -a python_sandbox_args=()
+    local -a task_evidence_args=()
+    if [ "$EVALUATION_TASK" = "humaneval" ]; then
+        python_sandbox_args=(
+            --bind "${REPO_ROOT}/src/eval/ptb_python_sandbox.py:/opt/ptb-python/ptb_python_sandbox.py:ro"
+            --bind "${PTB_PYTHON_BWRAP_PATH}:/opt/ptb-python/bwrap:ro"
+        )
+        task_evidence_args=(--formal-provenance "${EVAL_DIR}/runtime_provenance.json" --attempt-number "$eval_num")
+    fi
     mkdir -p \
         "${eval_cache}/vllm" \
         "${eval_cache}/torchinductor" \
@@ -633,13 +664,24 @@ run_evaluation() {
         --bind "${REPO_ROOT}:${REPO_ROOT}" \
         --bind "${EVAL_DIR}:${EVAL_DIR}" \
         --bind "${HF_MERGED}:${TMP_HF_CACHE}" \
+        "${python_sandbox_args[@]}" \
         --pwd "$(pwd)/src/eval/tasks/${EVALUATION_TASK}" \
         ${POST_TRAIN_BENCH_CONTAINERS_DIR}/vllm_debug.sif python "${EVAL_SCRIPT}" \
             --model-path "$EVAL_DIR/final_model" \
             --templates-dir ../../../../src/eval/templates \
             --limit -1 \
             ${max_tokens_arg} \
-            --json-output-file "${EVAL_DIR}/metrics.json" > "$EVAL_DIR/final_eval_${eval_num}.txt"
+            "${task_evidence_args[@]}" \
+            --json-output-file "${EVAL_DIR}/metrics.json" > "$EVAL_DIR/final_eval_${eval_num}.txt" 2>&1
+}
+
+ptb_metrics_ready() {
+    [ -f "${EVAL_DIR}/metrics.json" ] || return 1
+    if [ "$EVALUATION_TASK" = "humaneval" ]; then
+        python3 "${REPO_ROOT}/src/eval/tasks/humaneval/official_evidence.py" --result-dir "$EVAL_DIR"
+    else
+        return 0
+    fi
 }
 
 run_evaluation_with_retry() {
@@ -648,8 +690,12 @@ run_evaluation_with_retry() {
 
     for ((attempt=1; attempt<=max_retries; attempt++)); do
         sleep 5
-        if [ -f "${EVAL_DIR}/metrics.json" ]; then
+        if ptb_metrics_ready; then
             return 0
+        fi
+        if [ "$EVALUATION_TASK" = "humaneval" ] && [ -e "${EVAL_DIR}/metrics.json" ]; then
+            echo "ERROR: Existing HumanEval metrics lack valid bound evidence; preserve for investigation, do not overwrite." >&2
+            return 1
         fi
 
         EVAL_COUNTER=$((EVAL_COUNTER + 1))
@@ -658,7 +704,7 @@ run_evaluation_with_retry() {
 
         timeout --signal=TERM --kill-after=60s 28800s bash -c "$(declare -f run_evaluation with_huggingface_overlay ptb_reap_allocated_gpu_processes); run_evaluation \"$max_tokens_arg\" \"$EVAL_COUNTER\""
 
-        if [ -f "${EVAL_DIR}/metrics.json" ]; then
+        if ptb_metrics_ready; then
             return 0
         fi
     done
@@ -737,5 +783,5 @@ echo "================================"
 
 if [ "${POST_TRAIN_BENCH_REQUIRE_COMPLETE:-0}" = "1" ]; then
     python3 src/utils/validate_completed_run.py \
-        "$EVAL_DIR" --judge-profile "$JUDGE_PROFILE"
+        "$EVAL_DIR" --judge-profile "$JUDGE_PROFILE" --expected-task "$EVALUATION_TASK"
 fi
