@@ -225,6 +225,9 @@ if [ "${POST_TRAIN_BENCH_SLURM_RUNTIME_SMOKE:-0}" = "1" ]; then
             "$POST_TRAIN_BENCH_CONTEXT_VALIDATION_RECORD" \
             "$JOB_SCRATCH/context-probe-home"
     fi
+    if [ -n "${POST_TRAIN_BENCH_WMA_VALIDATION_DIR:-}" ]; then
+        bash src/commit_utils/slurm/wma_probe_smoke.sh "$AGENT" "$JOB_SCRATCH/wma-probe-home"
+    fi
     echo "Runtime smoke completed successfully."
     exit 0
 fi

@@ -29,6 +29,15 @@ while IFS= read -r env_name || [ -n "$env_name" ]; do
     [ -n "${!env_name+x}" ] && ENV_ARGS+=(--env "${env_name}=${!env_name}")
 done < "$PASSTHROUGH"
 
+if [ -n "${POST_TRAIN_BENCH_WMA_SIDECAR_CHECKOUT:-}" ]; then
+    CLI_HELP=$(apptainer exec --containall --cleanenv \
+        --env 'PATH=/root/.local/bin:/home/ben/.local/bin:/usr/local/bin:/usr/bin:/bin' \
+        --home "$PROBE_HOME:/home/ben" --writable-tmpfs "$IMAGE" claude --help)
+    for flag in --bare --disable-slash-commands --tools --strict-mcp-config --mcp-config; do
+        [[ "$CLI_HELP" == *"$flag"* ]] || { echo "ERROR: deployed Claude lacks required broker flag $flag" >&2; exit 1; }
+    done
+fi
+
 set +e
 apptainer exec --containall --cleanenv \
     --env 'PATH=/root/.local/bin:/home/ben/.local/bin:/usr/local/bin:/usr/bin:/bin' \
@@ -68,11 +77,14 @@ usage = result.get("modelUsage") or {}
 model_key, model_usage = next(iter(usage.items()), (None, {}))
 resolved_context = int(model_usage.get("contextWindow", 0))
 requested_context = int(requested_context)
+canonical_model = model_usage.get("canonicalModel") or model_key or init.get("model", "")
+model_verified = canonical_model.removesuffix("[1m]") == requested_model.removesuffix("[1m]")
 verified = (
     int(probe_status) == 0
     and not result.get("is_error")
     and result.get("api_error_status") in (None, 0)
     and resolved_context == requested_context
+    and model_verified
 )
 raw_bytes = Path(raw_path).read_bytes()
 image_path = Path(image)
@@ -90,6 +102,7 @@ if expected_image_sha256 and actual_image_sha256 != expected_image_sha256:
 record = {
     "schema_version": 1,
     "verified": verified,
+    "model_verified": model_verified,
     "verified_at": datetime.now(timezone.utc).isoformat(),
     "provider": "vertex",
     "project": os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID"),
