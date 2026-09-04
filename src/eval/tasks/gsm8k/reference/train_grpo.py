@@ -811,7 +811,8 @@ def _make_termination_monitor_class():
         CLIPPED_KEYS = ("completions/clipped_ratio", "clipped_ratio")
 
         def __init__(self, floor, probe_steps, probe_prompts, probe_tokens,
-                     halt=True, tokenizer=None, prompts=None, stop_token_id=None):
+                     halt=True, tokenizer=None, prompts=None, stop_token_id=None,
+                     probe_fewshot=None, train_fewshot=None):
             self.floor = floor
             self.probe_steps = probe_steps
             self.probe_tokens = probe_tokens
@@ -819,6 +820,11 @@ def _make_termination_monitor_class():
             self.tokenizer = tokenizer
             self.prompts = list(prompts or [])[:probe_prompts]
             self.stop_token_id = stop_token_id
+            # Recorded because a reader of the trace cannot otherwise tell whether the
+            # probe was asking about the graded rendering or about the training one,
+            # and that is the difference between a meaningful pass and a vacuous one.
+            self.probe_fewshot = probe_fewshot
+            self.train_fewshot = train_fewshot
             self.trainer = None
             self.armed = False        # a greedy probe has passed at least once
             self.collapsed = False
@@ -1009,6 +1015,9 @@ def _make_termination_monitor_class():
                 "probe_steps": self.probe_steps,
                 "probe_tokens": self.probe_tokens,
                 "probe_prompts": len(self.prompts),
+                "probe_fewshot": self.probe_fewshot,
+                "train_fewshot": self.train_fewshot,
+                "rendering_matches_grader": self.probe_fewshot == DEFAULT_FEWSHOT,
                 "halt": self.halt,
                 "armed": self.armed,
                 "collapsed": self.collapsed,
@@ -1105,6 +1114,53 @@ def build_dataset(args):
     # signature that has to absorb the whole row is one rename away from silently
     # swallowing the column it was meant to grade against.
     return ds.map(to_prompt, remove_columns=ds.column_names)
+
+
+def build_probe_prompts(args, n):
+    """The same training rows, rendered the way the *grader* will render them.
+
+    :func:`build_dataset` renders at ``--fewshot``, which the agent is free to lower --
+    91039_g7's ladder ran rungs at 0 and 91036_g6 trained at 2. The termination probe
+    must not inherit that choice, because the number the cell is scored on is computed
+    on the grader's 10-shot rendering, and a policy can terminate under a short prefix
+    and run to the cap under a long one. 91036_g6 is the worked example: its own
+    completions stopped at 82 tokens under the ``--fewshot 2`` rendering it trained on,
+    while the graded read of the same weights ran every row into the 4000-token cap and
+    came back 69.52. A probe rendered at ``--fewshot 2`` reports that model healthy,
+    which is exactly what happened -- the collapse is in the rendering gap, not in the
+    policy's behaviour on the distribution it was optimised for, so measuring the
+    latter cannot see it.
+
+    Same rows as training, so this is still the policy on its own data; only the prefix
+    length changes, and it changes to the one that is graded. Returns the prompts and
+    the depth actually used, so the caller can say when the two renderings differ.
+    """
+    from datasets import load_dataset
+
+    shots = args.fewshot if args.termination_probe_fewshot < 0 else args.termination_probe_fewshot
+
+    ds = load_dataset(args.dataset, args.dataset_config, split=args.train_split)
+    if args.max_train_samples > 0:
+        ds = ds.select(range(min(args.max_train_samples, len(ds))))
+    n = min(n, len(ds))
+
+    system_prefix = ""
+    if shots > 0:
+        system_prefix = build_fewshot_prefix(
+            args.dataset, args.dataset_config, shots, args.fewshot_seed
+        )
+
+    prompts = []
+    for i in range(n):
+        messages = []
+        if system_prefix:
+            messages.append({"role": "system", "content": system_prefix})
+        messages.append(
+            {"role": "user",
+             "content": MATH_PROMPT_TEMPLATE.format(prompt=ds[i]["question"])}
+        )
+        prompts.append(messages)
+    return prompts, shots
 
 
 # --------------------------------------------------------------------------------------
@@ -1239,6 +1295,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="greedy-decode a few prompts every N steps; 0 disables the probe")
     g.add_argument("--termination-probe-prompts", type=int, default=16,
                    help="how many training prompts each greedy probe decodes")
+    g.add_argument("--termination-probe-fewshot", type=int, default=DEFAULT_FEWSHOT,
+                   help="few-shot depth the probe RENDERS at, independent of --fewshot; "
+                        "defaults to the grader's, -1 mirrors --fewshot (the old behaviour)")
     g.add_argument("--termination-probe-tokens", type=int, default=1024,
                    help="token budget per probe; long enough that a looping policy shows")
     g.add_argument("--termination-floor", type=float, default=0.90,
@@ -1409,6 +1468,16 @@ def main(argv=None) -> int:
         report_to=args.report_to,
     )
 
+    probe_prompts, probe_shots = build_probe_prompts(args, args.termination_probe_prompts)
+    if probe_shots != args.fewshot:
+        logger.info(
+            "termination probe renders at fewshot=%d (the grader's) while training "
+            "renders at fewshot=%d. That is deliberate: the probe is asking whether the "
+            "checkpoint terminates on the prompts it will be SCORED on. Pass "
+            "--termination-probe-fewshot -1 to make it mirror --fewshot instead.",
+            probe_shots, args.fewshot,
+        )
+
     monitor = _make_termination_monitor_class()(
         args.termination_floor,
         args.termination_probe_steps,
@@ -1416,10 +1485,13 @@ def main(argv=None) -> int:
         args.termination_probe_tokens,
         halt=args.termination_halt,
         tokenizer=tokenizer,
-        # The probe decodes real training prompts, so what it measures is the policy
-        # on the distribution it is being optimised for rather than on a fixture.
-        prompts=[dataset[i]["prompt"]
-                 for i in range(min(args.termination_probe_prompts, len(dataset)))],
+        # Real training rows, but rendered at the grader's few-shot depth rather than
+        # at --fewshot. See build_probe_prompts: the quantity that decides the score is
+        # the greedy decode of the *graded* rendering, and 91036_g6 shows the two can
+        # disagree completely while every trainer-side statistic stays green.
+        prompts=probe_prompts,
+        probe_fewshot=probe_shots,
+        train_fewshot=args.fewshot,
         stop_token_id=stop_token_id,
     )
 

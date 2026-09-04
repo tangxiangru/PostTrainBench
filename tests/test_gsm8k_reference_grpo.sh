@@ -596,6 +596,114 @@ sys.exit(1 if bad else 0)
 PYMON
 python3 -B "$WORK/monitor.py" "$REF/train_grpo.py" || fail=1
 
+echo "[11] the greedy probe renders at the grader's few-shot depth, not at --fewshot"
+# [10] pins that the probe fires. This pins WHAT it decodes, which is the half that
+# decides whether a pass means anything. 91036_g6 trained at --fewshot 2, and under that
+# rendering its completions stopped at 82 tokens -- healthy by every reading the trainer
+# had. The graded read of the same weights renders 10-shot, ran every row into the
+# 4000-token cap, and came back 69.52. A probe that inherits --fewshot reports that model
+# green, so the probe must render the way the grader renders even when training does not.
+# No GPU and no network: the dataset is stubbed, but build_fewshot_prefix is the real one,
+# so a change to the prefix layout still moves these numbers.
+cat > "$WORK/rendering.py" <<'PYREN'
+import importlib.util, sys, types, random
+spec = importlib.util.spec_from_file_location("train_grpo", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["train_grpo"] = m
+spec.loader.exec_module(m)
+
+bad = 0
+def chk(label, cond):
+    global bad
+    print(("  PASS " if cond else "  FAIL ") + label)
+    if not cond:
+        bad = 1
+
+class FakeDS:
+    def __init__(self, rows): self.rows = rows
+    def __len__(self): return len(self.rows)
+    def __getitem__(self, i): return self.rows[i]
+    def shuffle(self, seed=0):
+        r = list(self.rows); random.Random(seed).shuffle(r); return FakeDS(r)
+    def select(self, rng): return FakeDS([self.rows[i] for i in rng])
+
+ROWS = [{"question": f"Q{i}?", "answer": f"reasoning {i}\n#### {i}"} for i in range(64)]
+fake = types.ModuleType("datasets")
+fake.load_dataset = lambda *a, **k: FakeDS(ROWS)
+sys.modules["datasets"] = fake
+
+def args(fewshot, probe_fewshot):
+    return types.SimpleNamespace(
+        fewshot=fewshot, termination_probe_fewshot=probe_fewshot,
+        dataset="openai/gsm8k", dataset_config="main", train_split="train",
+        max_train_samples=0, fewshot_seed=m.DEFAULT_FEWSHOT_SEED,
+    )
+
+def shots_in(prompts):
+    """How many worked examples the system message carries."""
+    if not prompts or prompts[0][0]["role"] != "system":
+        return 0
+    return prompts[0][0]["content"].count("ANSWER:")
+
+# The default: training shallow, probe at the grader's depth.
+p_default, n_default = m.build_probe_prompts(args(fewshot=2, probe_fewshot=m.DEFAULT_FEWSHOT), 8)
+chk("the default probe depth IS the grader's", n_default == m.DEFAULT_FEWSHOT)
+chk("the probe renders 10 shots while training renders 2", shots_in(p_default) == m.DEFAULT_FEWSHOT)
+chk("the probe returns the prompts it was asked for", len(p_default) == 8)
+
+# The 91036_g6 shape: the two renderings must actually differ, or this fix is a no-op.
+p_mirror, n_mirror = m.build_probe_prompts(args(fewshot=2, probe_fewshot=-1), 8)
+chk("-1 mirrors --fewshot (the old behaviour is still reachable)", n_mirror == 2)
+chk("mirroring renders 2 shots", shots_in(p_mirror) == 2)
+chk("the grader rendering and the training rendering are NOT the same string",
+    p_default[0][0]["content"] != p_mirror[0][0]["content"])
+chk("the graded rendering is the longer one",
+    len(p_default[0][0]["content"]) > len(p_mirror[0][0]["content"]))
+
+# The 91039_g7 shape: a ladder rung at --fewshot 0 has no system message at all, and the
+# probe must still ask the 10-shot question.
+p_zero, n_zero = m.build_probe_prompts(args(fewshot=0, probe_fewshot=m.DEFAULT_FEWSHOT), 4)
+chk("--fewshot 0 still probes at 10", n_zero == m.DEFAULT_FEWSHOT and shots_in(p_zero) == 10)
+p_zm, _ = m.build_probe_prompts(args(fewshot=0, probe_fewshot=-1), 4)
+chk("mirroring --fewshot 0 carries no system message", shots_in(p_zm) == 0)
+
+# The user turn is the graded one, not a bare question.
+user = [t for t in p_default[0] if t["role"] == "user"][0]["content"]
+chk("the user turn goes through MATH_PROMPT_TEMPLATE",
+    "Q0?" in user and user != "Q0?")
+chk("the rows are training rows", all(
+    any(f"Q{i}?" in t["content"] for t in p[1:]) for i, p in enumerate(p_default)))
+
+# Asking for more prompts than the split holds must clamp, not raise.
+p_big, _ = m.build_probe_prompts(args(fewshot=10, probe_fewshot=m.DEFAULT_FEWSHOT), 10_000)
+chk("a probe count past the end of the split clamps", len(p_big) == len(ROWS))
+
+# The DEFAULT is the whole fix. Every check above passes an explicit depth, so every one
+# of them still passes with the default reverted to -1 -- mutation-tested, and it caught
+# exactly that. What an agent actually runs is `train_grpo.py` with no probe flag at all,
+# so the value argparse hands it is the thing to pin.
+d = m.parse_args(["--output-dir", "/tmp/x", "--model", "Qwen/Qwen3-1.7B-Base"])
+chk("with NO probe flag, argparse hands back the grader's depth",
+    d.termination_probe_fewshot == m.DEFAULT_FEWSHOT)
+chk("and that is not the mirroring sentinel", d.termination_probe_fewshot != -1)
+chk("a shallow --fewshot does not drag the probe down with it",
+    m.parse_args(["--output-dir", "/tmp/x", "--model", "Q/M", "--fewshot", "2"]
+                 ).termination_probe_fewshot == m.DEFAULT_FEWSHOT)
+p_def, n_def = m.build_probe_prompts(
+    m.parse_args(["--output-dir", "/tmp/x", "--model", "Q/M", "--fewshot", "2"]), 4)
+chk("and end to end, the unflagged default renders 10 shots",
+    n_def == m.DEFAULT_FEWSHOT and shots_in(p_def) == m.DEFAULT_FEWSHOT)
+
+# The trace has to say which question was asked, or a green trace is unreadable.
+Monitor = m._make_termination_monitor_class()
+mon = Monitor(0.9, 25, 16, 1024, probe_fewshot=m.DEFAULT_FEWSHOT, train_fewshot=2)
+chk("the monitor records the depth it rendered at", mon.probe_fewshot == m.DEFAULT_FEWSHOT)
+chk("the monitor records the depth training used", mon.train_fewshot == 2)
+
+sys.exit(1 if bad else 0)
+PYREN
+python3 -B "$WORK/rendering.py" "$REF/train_grpo.py" || fail=1
+
 echo
 if [ "$fail" = 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
 exit $fail
