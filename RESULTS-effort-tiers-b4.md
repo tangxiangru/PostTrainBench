@@ -885,30 +885,66 @@ named here rather than left for someone to rediscover.
 So the outcome variable is measuring the treatment. That was not true of any earlier
 contrast in this file.
 
+## A third nuisance was present, and two seats are withdrawn for it
+
+`r2`'s `89727_g3` and `89809_g3` executed a reader on
+`RTT1/posttrainbench-gsm8k-recipes` — the answer key for the exact task they are graded
+on, which was public and cached in the shared `HF_HOME` while these packs ran.
+`89727_g3` ran `code/o001_restricted_rl_comparison.py`, which parses the recipe corpus
+out of the snapshot path; `89809_g3` wrote and ran `code/mine_recipes.py`, whose own
+docstring says it mines the corpus for what raised GSM8K accuracy "restricted to the 47
+runs whose trained_model is Qwen3-1.7B-Base — our exact setup". Both are graded **READ**
+by `ptb_ops/answer_key_audit.py`, which swept all 295 cells in the archive and found
+these two and no others (PATH 87, NAME 5, and those are cells that listed or declined
+the key rather than opening it).
+
+They are **withdrawn, not deleted**. Each carries a `VOIDED_ANSWER_KEY.json` marker
+written by `ptb_ops/void_cells.py` and its `metrics.json` is renamed
+`metrics.json.VOID_ANSWER_KEY`, so `utils.load_metrics` raises `VoidedCellError` and no
+rescore path can pick them up again. The row and its withdrawn score stay on record: an
+exclusion nobody can see is not auditable.
+
+**They were `r2`'s second and third highest cells, 0.8415 and 0.8385.** The leak was
+working for the treated arm, so the correction moves the result *away* from `r2`.
+
 ## The result is a null, on all three readings
+
+Over the **22 counted** cells — `sn` 12, `r2` 10:
 
 | reading | n | `sn` | `r2` | `sn` - `r2` | |
 | --- | ---: | ---: | ---: | ---: | --- |
-| cells, Welch | 12 / 12 | 78.97 | 77.82 | **+1.15** (SE 1.73) | p = 0.52, 95% CI [-2.25, +4.55] |
-| pack as the unit | 3 / 3 | | | **+1.15** (SE 1.90) | t_2 CI [-7.05, +9.35] |
-| blocked exact permutation | 343,000 arrangements | | | +1.15 | **p = 0.514** |
+| cells, Welch | 12 / 10 | 78.97 | 76.58 | **+2.39** (SE 1.75) | t 1.36, p = 0.195, 95% CI [-1.38, +6.15] |
+| pack as the unit | 3 / 3 | | | **+2.12** | per pack -0.42, +1.95, +4.83 |
+| blocked exact permutation | 85,750 arrangements | | | +2.39 | **p = 0.173** |
 
-Per pack, `sn` - `r2` is **-1.54, +0.15, +4.83**. The sign is not stable across three
+The permutation is over 85,750 and not 343,000 because two packs now hold seven seats:
+the count is `C(7,4) * C(7,4) * C(8,4)`, read off the packs rather than assumed to be
+`C(8,4)^3`. A wrong enumeration is invisible in the p, so the count is printed here.
+
+Per pack, `sn` - `r2` is **-0.42, +1.95, +4.83**. The sign is not stable across three
 packs of the same contrast, which is the same message the interval gives.
 
+**Superseded, and kept so the correction can be priced.** Counting all 24 cells — the
+reading this file carried until 2026-09-04 — gave **+1.15** (SE 1.73), t 0.66, p 0.516,
+permutation p 0.514 over 343,000 arrangements, pooled sd 4.25, floor 4.9, per pack
+-1.54 / +0.15 / +4.83. Withdrawing two cells **doubles the point estimate** and does not
+change the verdict. That is the argument for doing it at all: a null is the worst place
+to leave a contaminated score, because nobody goes back and re-opens a null.
+
 Direction matters for what to do next: `r2` is the arm *with* the two sections, so the
-point estimate on adding them is **-1.15 pt**, and the honest summary is that they buy
+point estimate on adding them is **-2.39 pt**, and the honest summary is that they buy
 nothing and may cost a little.
 
 ## What this can and cannot rule out
 
-Pooled sd is 4.25 pt, so 12 v 12 has 80% power against about **4.9 pt**. The contrast
-therefore excludes an effect the size of anything else on this board and says nothing
-about a one- or two-point one: detecting the observed +1.15 would need roughly **215
-cells per arm**, which at 10 h and one GPU per cell is not a measurement anyone is going
-to make here.
+Pooled sd is 3.91 pt. The arms are no longer equal, so the floor is
+`2.8 * sd * sqrt(1/12 + 1/10)` = about **4.7 pt** at 80% power — `sqrt(2/n)` would still
+have returned a number here, and it would have been the floor of a design that no longer
+exists. The contrast therefore excludes an effect the size of anything else on this board
+and says nothing about a one- or two-point one: detecting the observed +2.39 would need
+roughly **50 cells per arm**, about 13 packs.
 
-The two arms are also not equally noisy — `sn` sd 2.84, `r2` sd 5.30, and `r2` owns the
+The two arms are also not equally noisy — `sn` sd 2.84, `r2` sd 4.91, and `r2` owns the
 three lowest cells on the board (0.6854, 0.7127, 0.7157). Welch is used above for that
 reason; pricing the interval at the control's spread would have understated it.
 
@@ -917,5 +953,14 @@ reason; pricing the interval at the control's spread would have understated it.
 `claude_autor_sn` carries 8 further scored cells from 84998/84999 and `claude_autor_r2`
 carries 18 from 86725-87815. Pooling all of them gives +1.49 +/- 1.13 (Welch p = 0.19) —
 the same null — but those cells come from different builds on different days, which is
-the drift the b4 sections above show inverting a whole ranking. The 12 v 12 in-pack
+the drift the b4 sections above show inverting a whole ranking. The 12 v 10 in-pack
 number is the one to quote.
+
+## Where this reading is maintained
+
+The numbers above are recomputed, not transcribed. `tools/ptb_blocked_campaign.py` in
+the AutoR repo freezes the 24 cells and recomputes every statistic on every call;
+`--check` re-reads the void markers off `/rmeng_data/robtang/ptb-results` and exits 6 if
+the frozen census and the tree disagree in either direction.
+`docs/posttrainbench.md` there carries the same reading under a gate that holds the prose
+to the census both ways. If this section and that one ever disagree, that one is right.
