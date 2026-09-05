@@ -1,0 +1,21 @@
+# submit log for the sn-vs-r2 powered replication -- see launch_sn_vs_r2_replication.sh
+# a row is what was SUBMITTED, not what survived; ask sacct for the state
+jobid	name	num_hours	walltime	note
+92581	ptb-sn-vs-r2-p13	10	16:00:00	shredded on slurm2-a3nodesetondem-0, replaced by p26
+92582	ptb-sn-vs-r2-p14	10	16:00:00
+92583	ptb-sn-vs-r2-p15	10	16:00:00
+92584	ptb-sn-vs-r2-p16	10	16:00:00
+92585	ptb-sn-vs-r2-p17	10	16:00:00	shredded on slurm2-a3nodesetondem-0, replaced by p27
+92586	ptb-sn-vs-r2-p18	10	16:00:00	shredded on slurm2-a3nodesetondem-0, replaced by p28
+92587	ptb-sn-vs-r2-p19	10	16:00:00	shredded on slurm2-a3nodesetondem-0, replaced by p29
+92588	ptb-sn-vs-r2-p20	10	16:00:00	shredded on slurm2-a3nodesetondem-0, replaced by p30
+92589	ptb-sn-vs-r2-p21	10	16:00:00
+92590	ptb-sn-vs-r2-p22	10	16:00:00
+92591	ptb-sn-vs-r2-p23	10	16:00:00
+92592	ptb-sn-vs-r2-p24	10	16:00:00
+92593	ptb-sn-vs-r2-p25	10	16:00:00
+92597	ptb-sn-vs-r2-p26	10	16:00:00
+92598	ptb-sn-vs-r2-p27	10	16:00:00
+92599	ptb-sn-vs-r2-p28	10	16:00:00
+92600	ptb-sn-vs-r2-p29	10	16:00:00
+92601	ptb-sn-vs-r2-p30	10	16:00:00

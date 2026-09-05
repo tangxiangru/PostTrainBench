@@ -15,9 +15,19 @@
 # eight-GPU packs on all three of someone else's nodes for sixteen hours. They ran 3.5h
 # before being requeued off. It happened again on 2026-09-04 with 91755 and 91723, two
 # hours each on 0-0 and 0-1. So the reservation is not the only guard -- name the nodes:
-#SBATCH --exclude=slurm2-a3nodeset0-[0-2]
+#
+# slurm2-a3nodesetondem-0 is on the list for a different reason: it SHREDS packs. On
+# 2026-09-05 five packs (92581/92585/92586/92587/92588) landed there in sequence, cleared
+# every guard in this file -- payload shas, answer-key cache, drawn seat map, in-pack
+# control -- launched all eight cells, and were then `CANCELLED by 0` after 67-71 seconds,
+# every one of them. No competing root job was pending for the node and no reservation
+# covers it but mine. Packs on slurm2-a3nodeset-[0-1] and 0-3 submitted in the same batch
+# ran on undisturbed, so it is the node and not the pack. Whatever root has running there
+# reaps a non-root job about a minute in, and the scheduler will happily feed it the whole
+# queue one pack at a time.
+#SBATCH --exclude=slurm2-a3nodeset0-[0-2],slurm2-a3nodesetondem-0
 # A command-line --exclude REPLACES this line rather than adding to it, so any pack
-# submitted with its own --exclude must carry slurm2-a3nodeset0-[0-2] in it.
+# submitted with its own --exclude must carry both entries.
 #SBATCH --nodes=1
 #SBATCH --exclusive
 #SBATCH --gres=gpu:8
