@@ -345,7 +345,13 @@ solve_task() {
             --env "PTB_PYTHON_SOURCE_IMAGE_SHA256=${_python_image_sha}"
         )
     fi
-    timeout --signal=TERM --kill-after=30s "$((NUM_HOURS * 60 + 5))m" \
+    local -a container_wrapper=(timeout --signal=TERM --kill-after=30s "$((NUM_HOURS * 60 + 5))m")
+    if [ "$EVALUATION_TASK" = "humaneval" ]; then
+        container_wrapper=(python3 "$(pwd)/src/commit_utils/slurm/humaneval_environment_acceptance.py"
+            --container-command --timeout-seconds "$((NUM_HOURS * 3600 + 300))"
+            --journal "${EVAL_DIR}/official_eval/container-lifecycle/scientist-${BASHPID}.json" --)
+    fi
+    "${container_wrapper[@]}" \
     apptainer exec \
         --nv \
         "${NVCCLI_ARGS[@]}" \
@@ -642,7 +648,12 @@ run_evaluation() {
         "${eval_home}/.config"
     ptb_reap_allocated_gpu_processes
     sleep 5
-    with_huggingface_overlay apptainer exec \
+    local -a evaluator_wrapper=()
+    if [ "$EVALUATION_TASK" = "humaneval" ]; then
+        evaluator_wrapper=(python3 "${REPO_ROOT}/src/commit_utils/slurm/humaneval_environment_acceptance.py"
+            --container-command --journal "${EVAL_DIR}/official_eval/container-lifecycle/evaluator-${eval_num}.json" --)
+    fi
+    with_huggingface_overlay "${evaluator_wrapper[@]}" apptainer exec \
         --nv \
         -c \
         --cleanenv \

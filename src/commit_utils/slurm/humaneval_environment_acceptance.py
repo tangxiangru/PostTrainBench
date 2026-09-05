@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import ctypes
 import hashlib
 import json
 import math
@@ -9,7 +11,9 @@ import os
 import select
 import signal
 import subprocess
+import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 DATA_RELATIVE = "hub/datasets--openai--openai_humaneval/snapshots/7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544/openai_humaneval/test-00000-of-00001.parquet"
@@ -68,21 +72,29 @@ def exited(fd):
     return bool(poll.poll(0))
 
 
-def execute(command, output, seconds, *, expect_timeout=False, ready_file=None):
-    """Observe exact descendants; arm the outer deadline after native admission.
+def execute(command, output, seconds, *, expect_timeout=False, ready_file=None,
+            require_sandbox=True):
+    """Run one container as a child subreaper and clean only its owned descendants.
 
-    The actual trusted supervisor supplies identity-checked readiness. GNU timeout receives
-    SIGALRM on its own pidfd three seconds later, the same signal as its timer.
-    The outer test uses a five-second escalation grace so its cleanup must
-    finish before the independent 30-second program timeout can mask failure.
-    A startup-only timeout, dead sandbox or emergency cleanup cannot pass.
+    The production scientist/evaluator wrapper and admission probe use this exact
+    lifecycle. Native admission arms the probe's three-second outer deadline;
+    five-second escalation plus bounded cleanup must finish before the independent
+    thirty-second inner program timeout. PID handles, never names/users, authorize
+    cleanup. This foreground supervisor must start without other children.
     """
-    handles, sandbox_handles, supervisor_handles, observations = {}, set(), {}, []
+    if descendants(os.getpid()) != {os.getpid()}:
+        raise RuntimeError('container supervisor must start without existing children')
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    if libc.prctl(37, ctypes.byref(previous), 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), 'cannot read child-subreaper state')
+    if libc.prctl(36, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), 'cannot become child subreaper')
+    handles, records, sandbox_handles, supervisor_handles, observations = {}, {}, set(), {}, []
+    actions = []
     observed_sandbox = False
     admitted_at = None
-    alarm_sent = False
-    live_at_alarm = False
-    supervisor_live_at_alarm = False
+    alarm_sent = live_at_alarm = supervisor_live_at_alarm = False
     admission_event = None
     process = None
     root_key = None
@@ -93,15 +105,25 @@ def execute(command, output, seconds, *, expect_timeout=False, ready_file=None):
         try:
             ticks = start_ticks(pid)
             key = (pid, ticks)
-            if key in sandbox_handles or key in supervisor_handles:
+            if records.get(key, {}).get('terminal'):
+                try:
+                    os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    pass
                 return key
             if key not in handles:
                 fd = os.pidfd_open(pid)
-                if ticks != start_ticks(pid):
+                # Revalidate ancestry after pinning: a scanned PID may have been
+                # recycled before pidfd_open. A stable identity alone is not ownership.
+                if ((not (pid == process.pid and process.returncode is None)
+                     and pid not in descendants(os.getpid()))
+                        or ticks != start_ticks(pid)):
                     os.close(fd)
                     return None
                 handles[key] = fd
                 fd = None
+                records[key] = {'pid': pid, 'start_ticks': ticks, 'terminal': False,
+                                'comm': (Path('/proc') / str(pid) / 'comm').read_text().strip()}
             args = (Path('/proc') / str(pid) / 'cmdline').read_bytes().split(b'\0')
             if b'--unshare-all' in args and b'--as-pid-1' in args:
                 sandbox_handles.add(key)
@@ -121,30 +143,64 @@ def execute(command, output, seconds, *, expect_timeout=False, ready_file=None):
             observations.append(f'{pid}: {type(exc).__name__}')
             return None
 
-    def terminate_known():
+    def reap_finished():
+        for key, fd in list(handles.items()):
+            if not exited(fd):
+                continue
+            records.setdefault(key, {'pid': key[0], 'start_ticks': key[1]})['terminal'] = True
+            if process is not None and key[0] == process.pid:
+                process.poll()  # Preserve Popen's native return code.
+            else:
+                try:
+                    os.waitpid(key[0], os.WNOHANG)
+                except ChildProcessError:
+                    pass  # Descendant still belongs to its living parent.
+            os.close(fd)
+            del handles[key]
+
+    def scan_owned():
+        # Orphans from setsid/double-fork are adopted here, even if their original
+        # ancestor exited between polls. There were no unrelated initial children.
+        for pid in descendants(os.getpid()) - {os.getpid()}:
+            observe(pid)
+        reap_finished()
+
+    def terminate_owned():
         for sig, delay in ((signal.SIGTERM, 2), (signal.SIGKILL, 2)):
-            for fd in handles.values():
-                if not exited(fd):
-                    try:
-                        signal.pidfd_send_signal(fd, sig)
-                    except ProcessLookupError:
-                        pass
             deadline = time.monotonic() + delay
-            while any(not exited(fd) for fd in handles.values()) and time.monotonic() < deadline:
+            sent = set()
+            while True:
+                try:
+                    scan_owned()
+                except Exception as exc:  # noqa: BLE001 - retain failure, still stop pinned handles
+                    observations.append(f'cleanup observation: {type(exc).__name__}')
+                for key, fd in list(handles.items()):
+                    if key not in sent and not exited(fd):
+                        try:
+                            signal.pidfd_send_signal(fd, sig)
+                            actions.append({'pid': key[0], 'start_ticks': key[1], 'signal': sig.name})
+                        except ProcessLookupError:
+                            pass
+                        sent.add(key)
+                reap_finished()
+                if not handles or time.monotonic() >= deadline:
+                    break
                 time.sleep(.05)
+        scan_owned()
 
     try:
-        with output.open('xb') as log:
-            process = subprocess.Popen(
-                ['timeout', '--signal=TERM', '--kill-after=5s' if expect_timeout else '--kill-after=30s',
-                 f'{seconds}s', *command],
-                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                start_new_session=True)
+        context = output.open('xb') if output is not None else nullcontext(None)
+        with context as log:
+            launch = command if seconds is None else [
+                'timeout', '--signal=TERM', '--kill-after=5s' if expect_timeout else '--kill-after=30s',
+                f'{seconds}s', *command]
+            process = subprocess.Popen(launch, stdin=subprocess.DEVNULL, stdout=log,
+                                       stderr=subprocess.STDOUT if log is not None else None,
+                                       start_new_session=True)
             root_key = observe(process.pid)
-            absolute_deadline = time.monotonic() + seconds + 35
+            absolute_deadline = None if seconds is None else time.monotonic() + seconds + 35
             while process.poll() is None:
-                for pid in descendants(process.pid):
-                    observe(pid)
+                scan_owned()
                 if expect_timeout and ready_file is not None and admitted_at is None:
                     try:
                         ready = json.loads(ready_file.read_text())
@@ -159,28 +215,31 @@ def execute(command, output, seconds, *, expect_timeout=False, ready_file=None):
                         if (type(stamp) not in (int, float) or not math.isfinite(stamp)
                                 or not 0 <= time.monotonic() - stamp <= seconds):
                             raise ValueError('invalid native admission clock')
-                        admitted_at = stamp
-                        admission_event = event
+                        admitted_at, admission_event = stamp, event
                 if admitted_at is not None and not alarm_sent and time.monotonic() >= admitted_at + 3:
-                    live_at_alarm = any(not exited(handles[key]) for key in sandbox_handles)
+                    live_at_alarm = any(key in handles and not exited(handles[key]) for key in sandbox_handles)
                     supervisor_live_at_alarm = any(
-                        namespace_pid == admission_event.get('supervisor_pid') and not exited(handles[key])
+                        namespace_pid == admission_event.get('supervisor_pid')
+                        and key in handles and not exited(handles[key])
                         for key, namespace_pid in supervisor_handles.items())
-                    if root_key is None or exited(handles[root_key]):
+                    if root_key not in handles or exited(handles[root_key]):
                         raise RuntimeError('outer timer handle unavailable at deadline')
                     signal.pidfd_send_signal(handles[root_key], signal.SIGALRM)
                     alarm_sent = True
-                if time.monotonic() > absolute_deadline:
+                if absolute_deadline is not None and time.monotonic() > absolute_deadline:
                     raise TimeoutError('outer timeout supervisor exceeded its bound')
                 time.sleep(.1)
             returncode = process.wait()
-            log.flush()
-            os.fsync(log.fileno())
-        deadline = time.monotonic() + 3
-        while any(not exited(fd) for fd in handles.values()) and time.monotonic() < deadline:
-            time.sleep(.05)
-        survivors = [pid for (pid, _), fd in handles.items() if not exited(fd)]
-        evidence = {'returncode': returncode, 'timed_out': returncode in {124, 137},
+            if log is not None:
+                log.flush()
+                os.fsync(log.fileno())
+        scan_owned()
+        before_cleanup = [pid for (pid, _), fd in handles.items() if not exited(fd)]
+        terminate_owned()
+        survivors = sorted({pid for (pid, _), fd in handles.items() if not exited(fd)}
+                           | (descendants(os.getpid()) - {os.getpid()}))
+        evidence = {'returncode': returncode,
+                    'timed_out': returncode in {124, 137} or (returncode == -signal.SIGKILL and alarm_sent),
                     'cleanup_complete': not survivors, 'observed_native_sandbox': observed_sandbox,
                     'admitted_before_timeout': admitted_at is not None,
                     'admitted_sandbox_live_at_timeout': live_at_alarm, 'alarm_sent': alarm_sent,
@@ -188,28 +247,56 @@ def execute(command, output, seconds, *, expect_timeout=False, ready_file=None):
                     'admission_event': admission_event,
                     'elapsed_since_admission': None if admitted_at is None else time.monotonic() - admitted_at,
                     'termination_grace_seconds': 5 if expect_timeout else 30,
-                    'observation_errors': observations,
-                    'observed_processes': [{'pid': pid, 'start_ticks': ticks, 'terminal': exited(fd)}
-                                           for (pid, ticks), fd in sorted(handles.items())],
-                    'survivors': survivors}
-        if survivors:
-            terminate_known()
-        evidence['passed'] = (not survivors and not observations and observed_sandbox and
-                              (evidence['timed_out'] and alarm_sent and live_at_alarm and supervisor_live_at_alarm
-                               and evidence['elapsed_since_admission'] < 30
-                               if expect_timeout else returncode == 0))
+                    'observation_errors': observations, 'cleanup_actions': actions,
+                    'survivors_before_cleanup': before_cleanup,
+                    'observed_processes': [records[key] for key in sorted(records)],
+                    'survivors': survivors, 'lifecycle': 'owned-subreaper-v1'}
+        evidence['passed'] = (not survivors and not observations and (observed_sandbox or not require_sandbox)
+                              and (evidence['timed_out'] and alarm_sent and live_at_alarm and supervisor_live_at_alarm
+                                   and evidence['elapsed_since_admission'] < 30
+                                   if expect_timeout else returncode == 0))
         return evidence
     except BaseException:
-        terminate_known()
-        if process is not None:
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                pass
+        try:
+            terminate_owned()
+        finally:
+            if process is not None:
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
         raise
     finally:
         for fd in handles.values():
             os.close(fd)
+        libc.prctl(36, previous.value, 0, 0, 0)
+
+
+def container_main(argv):
+    parser = argparse.ArgumentParser(description='Run one owned container and reap its descendants')
+    parser.add_argument('--timeout-seconds', type=int)
+    parser.add_argument('--journal', required=True, type=Path)
+    parser.add_argument('command', nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    command = args.command[1:] if args.command[:1] == ['--'] else args.command
+    if not command or (args.timeout_seconds is not None and args.timeout_seconds <= 0):
+        parser.error('a command and a positive optional timeout are required')
+    args.journal.parent.mkdir(parents=True, exist_ok=True)
+    # Reserve an immutable record before execution, without storing credential-bearing argv.
+    with args.journal.open('x') as journal:
+        try:
+            result = execute(command, None, args.timeout_seconds, require_sandbox=False)
+        except BaseException as exc:  # noqa: BLE001 - retain lifecycle failure and fail the command
+            result = {'passed': False, 'error': type(exc).__name__, 'returncode': 1}
+        result['command_sha256'] = hashlib.sha256(json.dumps(command).encode()).hexdigest()
+        json.dump(result, journal, indent=2)
+        journal.write('\n')
+        journal.flush()
+        os.fsync(journal.fileno())
+    code = result['returncode']
+    if code == 0 and not result['passed']:
+        return 1
+    return 128 - code if code < 0 else code
 
 
 def image_command(source, image, digest, work, scratch, bwrap, dataset, *, outer=False):
@@ -353,4 +440,4 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
-    raise SystemExit(main())
+    raise SystemExit(container_main(sys.argv[2:]) if sys.argv[1:2] == ['--container-command'] else main())

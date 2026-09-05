@@ -160,7 +160,11 @@ def test_observation_exception_still_stops_the_owned_producer(tmp_path, monkeypa
         created.append(process)
         return process
 
-    def fail_descendants(_pid):
+    real_descendants = runner.descendants
+
+    def fail_descendants(pid):
+        if not created:
+            return real_descendants(pid)
         raise RuntimeError("synthetic observer failure")
 
     monkeypatch.setattr(runner.subprocess, "Popen", popen)
@@ -168,3 +172,52 @@ def test_observation_exception_still_stops_the_owned_producer(tmp_path, monkeypa
     with pytest.raises(RuntimeError, match="synthetic observer"):
         runner.execute(fake_backend("import time; time.sleep(30)"), tmp_path / "failure.log", 35)
     assert created[0].poll() is not None
+
+
+def test_production_wrapper_cleans_detached_child_without_touching_other_process(tmp_path):
+    import json
+    import os
+    import subprocess
+
+    child_file = tmp_path / 'detached-pid'
+    journal = tmp_path / 'lifecycle.json'
+    # This unrelated process belongs to the test, outside the wrapper ancestry.
+    unrelated = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+    child = f"import os,signal,time,pathlib; os.setsid(); signal.signal(signal.SIGTERM,signal.SIG_IGN); pathlib.Path({str(child_file)!r}).write_text(str(os.getpid())); time.sleep(30)"
+    parent = f"import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',{child!r}]); time.sleep(.5)"
+    try:
+        completed = subprocess.run(
+            [sys.executable, runner.__file__, '--container-command', '--journal', str(journal),
+             '--', sys.executable, '-c', parent], timeout=12, check=False)
+        result = json.loads(journal.read_text())
+        detached_pid = int(child_file.read_text())
+        assert completed.returncode == 0 and result['cleanup_complete']
+        assert detached_pid in result['survivors_before_cleanup']
+        assert any(x['pid'] == detached_pid and x['signal'] == 'SIGKILL' for x in result['cleanup_actions'])
+        assert not Path(f'/proc/{detached_pid}').exists()  # Reaped, not just a zombie.
+        assert unrelated.poll() is None
+        assert all(x['terminal'] for x in result['observed_processes'])
+        assert os.getpid() not in [x['pid'] for x in result['observed_processes']]
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=3)
+
+
+def test_production_wrapper_preserves_command_failure(tmp_path):
+    import json
+    import subprocess
+
+    journal = tmp_path / 'failed.json'
+    result = subprocess.run([sys.executable, runner.__file__, '--container-command', '--journal', str(journal),
+                             '--', sys.executable, '-c', 'raise SystemExit(7)'], check=False, timeout=5)
+    assert result.returncode == 7
+    assert json.loads(journal.read_text())['passed'] is False
+
+
+def test_adopted_zombie_is_reaped_after_original_parent_exits(tmp_path):
+    import os
+
+    code = "import os,time; pid=os.fork(); time.sleep(.6) if pid else None; os._exit(0)"
+    result = runner.execute([sys.executable, '-c', code], tmp_path / 'zombie.log', 3, require_sandbox=False)
+    assert result['passed'] and result['cleanup_complete']
+    assert runner.descendants(os.getpid()) == {os.getpid()}

@@ -29,3 +29,16 @@ runtime copies stay in scratch and are not archived as experiment evidence.
 Consumers must verify the receipt, manifests, actual raw bytes and native case
 semantics, not just the top-level status. Node success is narrower than model or
 benchmark validation, and only admits the observed node under the frozen runtime.
+
+Actual ondem0 attempt93118 established normal native execution, data access,
+internal timeout and isolation, but outer forced termination left two live owned
+children. It remains a failed attempt. The next frozen version uses the same
+owned child-subreaper lifecycle for acceptance and the production HumanEval
+scientist/evaluator. After command exit it reaps adopted children and applies
+bounded TERM/KILL only through pinned descendant pidfds, revalidating ancestry
+and start identity. A pass requires no remaining descendant graph, no observer
+errors and the existing admission-to-end bound. The production scientist retains
+its original time budget; evaluator deadlines remain supplied by the existing
+outer caller. Logs retain original command failure and lifecycle evidence without
+credential-bearing argv. This repairs the execution path; it does not reinterpret
+the earlier emergency cleanup as acceptance.
