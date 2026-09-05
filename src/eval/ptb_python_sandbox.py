@@ -772,12 +772,16 @@ def _command(runtime):
     return command + [runtime.interpreter, "-I", "-S", "-c", _BOOTSTRAP]
 
 
-def _execute_python(code, runtime, *, limits=DEFAULT_LIMITS, cancel=None):
+def _execute_python(code, runtime, *, limits=DEFAULT_LIMITS, cancel=None, admission_fd=None):
     """Execute precisely one generated python -c, with no retries/fallback.
 
     TimeoutError means an admitted program exceeded its wall deadline.
     Infrastructure/dependency failures never become Execution(success=False).
     """
+    if admission_fd is not None:
+        if type(admission_fd) is not int or admission_fd <= 2 or not stat.S_ISFIFO(os.fstat(admission_fd).st_mode):
+            raise SandboxInfrastructureError("admission channel must be an inherited pipe")
+        os.set_inheritable(admission_fd, False)
     if (
         not isinstance(code, str)
         or len(code.encode()) > limits.code_bytes
@@ -891,6 +895,18 @@ def _execute_python(code, runtime, *, limits=DEFAULT_LIMITS, cancel=None):
                     report["started"] = True
                     report["startup_seconds"] = time.monotonic() - started
                     deadline = time.monotonic() + limits.wall_seconds
+                    if admission_fd is not None:
+                        # This optional trusted-parent pipe is never inherited
+                        # by the untrusted command. Notify only after attestation
+                        # and the actual permission to execute, not at bootstrap.
+                        event = {"schema": "ptb-python-admission-v1", "started": True,
+                                 "supervisor_pid": os.getpid(),
+                                 "attested_namespace_pid": message["pid"],
+                                 "admitted_monotonic": time.monotonic(),
+                                 "code_sha256": report["code_sha256"]}
+                        os.write(admission_fd, json.dumps(event).encode() + b"\n")
+                        os.close(admission_fd)
+                        admission_fd = None
                 elif name == "notify":
                     if process.poll() is not None:
                         selector.unregister(listener)
@@ -1128,31 +1144,65 @@ def _execute_python(code, runtime, *, limits=DEFAULT_LIMITS, cancel=None):
             raise cleanup_error from error
 
 
-def execute_python(code, runtime, *, limits=DEFAULT_LIMITS, cancel=None):
+def execute_python(code, runtime, *, limits=DEFAULT_LIMITS, cancel=None, on_admission=None):
     """Run the trusted supervisor separately so notification waits are cancellable.
 
     Generated code only runs inside bubblewrap. The outer helper receives a
     clean environment and owns its own signal timer, independent of Inspect.
     """
     cancel = cancel or threading.Event()
-    payload = json.dumps(
-        {"code": code, "runtime": asdict(runtime), "limits": asdict(limits)}
-    ).encode()
-    helper = subprocess.Popen(
-        [sys.executable, "-I", "-S", str(Path(__file__).resolve()), "--supervise"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
-        cwd="/",
-        start_new_session=True,
-    )
+    if on_admission is not None and not callable(on_admission):
+        raise TypeError("on_admission must be a trusted caller callback")
+    request = {"code": code, "runtime": asdict(runtime), "limits": asdict(limits)}
+    admission_read = admission_write = None
+    admission_buffer = bytearray()
+    admission_reported = False
+    if on_admission is not None:
+        admission_read, admission_write = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+        request["admission_fd"] = admission_write
+    payload = json.dumps(request).encode()
+    try:
+        helper = subprocess.Popen(
+            [sys.executable, "-I", "-S", str(Path(__file__).resolve()), "--supervise"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, cwd="/", start_new_session=True,
+            pass_fds=() if admission_write is None else (admission_write,),
+        )
+    except BaseException:
+        if admission_read is not None:
+            os.close(admission_read)
+        raise
+    finally:
+        if admission_write is not None:
+            os.close(admission_write)
+
+    def read_admission():
+        nonlocal admission_reported
+        if admission_read is None or admission_reported:
+            return
+        try:
+            admission_buffer.extend(os.read(admission_read, 4096))
+        except BlockingIOError:
+            return
+        if len(admission_buffer) > 4096:
+            raise SandboxInfrastructureError("oversized supervisor admission event")
+        if b"\n" not in admission_buffer:
+            return
+        event = json.loads(admission_buffer.split(b"\n", 1)[0])
+        if (event.get("schema") != "ptb-python-admission-v1" or event.get("started") is not True
+                or event.get("supervisor_pid") != helper.pid
+                or event.get("code_sha256") != hashlib.sha256(code.encode()).hexdigest()
+                or event.get("attested_namespace_pid") != 1):
+            raise SandboxInfrastructureError("supervisor admission identity differs")
+        admission_reported = True
+        on_admission(event)
     deadline = time.monotonic() + limits.startup_seconds + limits.wall_seconds + 15
     pending_error = None
     report_received = False
     try:
         first = True
         while True:
+            read_admission()
             if cancel.is_set():
                 raise SandboxCancelled("execution cancelled")
             if time.monotonic() > deadline:
@@ -1163,6 +1213,7 @@ def execute_python(code, runtime, *, limits=DEFAULT_LIMITS, cancel=None):
                 stdout, stderr = helper.communicate(
                     input=payload if first else None, timeout=0.05
                 )
+                read_admission()
                 break
             except subprocess.TimeoutExpired:
                 first = False
@@ -1246,9 +1297,11 @@ def execute_python(code, runtime, *, limits=DEFAULT_LIMITS, cancel=None):
                 )
         for stream in (helper.stdin, helper.stdout, helper.stderr):
             stream.close()
+        if admission_read is not None:
+            os.close(admission_read)
 
 
-def register_inspect(runtime, *, limits=DEFAULT_LIMITS, name="ptb_python"):
+def register_inspect(runtime, *, limits=DEFAULT_LIMITS, name="ptb_python", on_admission=None):
     """Register once under a fresh name; all duplicates deliberately fail."""
     if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", name):
         raise SandboxInfrastructureError(
@@ -1340,7 +1393,8 @@ def register_inspect(runtime, *, limits=DEFAULT_LIMITS, name="ptb_python"):
             def run():
                 try:
                     outcome["result"] = execute_python(
-                        cmd[2], runtime, limits=selected, cancel=cancel
+                        cmd[2], runtime, limits=selected, cancel=cancel,
+                        **({"on_admission": on_admission} if on_admission is not None else {})
                     )
                 except BaseException as exc:  # noqa: BLE001 -- preserve worker exception in awaiting task
                     outcome["error"] = exc
@@ -1404,6 +1458,7 @@ if __name__ == "__main__":
             request["code"],
             Runtime(**request["runtime"]),
             limits=Limits(**request["limits"]),
+            **({"admission_fd": request["admission_fd"]} if "admission_fd" in request else {}),
         )
         message = {"kind": "execution", "value": asdict(outcome)}
     except BaseException as exc:  # noqa: BLE001 -- serialize failure after owned-tree cleanup, including SIGINT

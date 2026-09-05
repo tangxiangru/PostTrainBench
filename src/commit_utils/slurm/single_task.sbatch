@@ -170,6 +170,24 @@ echo "Node: ${SLURMD_NODENAME:-$(hostname)}"
 echo "GPU mode: ${GPU_MODE}; CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "Scratch: ${JOB_SCRATCH}"
 
+if [ -n "${POST_TRAIN_BENCH_FROZEN_REQUESTED_NODES:-}" ]; then
+    case ",${POST_TRAIN_BENCH_FROZEN_REQUESTED_NODES}," in
+        *",${SLURMD_NODENAME},"*) ;;
+        *) echo "ERROR: allocation is outside frozen requested nodes" >&2; exit 1 ;;
+    esac
+fi
+
+if [ -n "${POST_TRAIN_BENCH_ENVIRONMENT_ACCEPTANCE:-}" ]; then
+    if [ "$POST_TRAIN_BENCH_ENVIRONMENT_ACCEPTANCE" != "humaneval" ]; then
+        echo "ERROR: unsupported environment target" >&2
+        exit 1
+    fi
+    # The runner persists success/failure evidence outside scratch before EXIT.
+    # It never enters provider context probing or scientific run_task.sh.
+    python src/commit_utils/slurm/humaneval_environment_acceptance.py
+    exit $?
+fi
+
 bash src/commit_utils/slurm/preflight.sh "$NUM_GPUS" "$EVALUATION_TASK" "$AGENT" "$MODEL_TO_TRAIN"
 
 if [ "${POST_TRAIN_BENCH_SLURM_PREFLIGHT_ONLY:-0}" = "1" ]; then

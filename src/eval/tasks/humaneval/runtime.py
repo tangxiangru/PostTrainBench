@@ -20,7 +20,7 @@ BWRAP_SHA256 = "d78807229d616606e339c5988392b9e0ab4a6a6998fa51e4590837f426a12fca
 HELPER_PATH = Path("/opt/ptb-python/ptb_python_sandbox.py")
 
 
-def register_backend(evidence_dir, *, image_reference, image_sha256):
+def register_backend(evidence_dir, *, image_reference, image_sha256, on_admission=None):
     from inspect_ai.util import store
 
     helper_bytes = HELPER_PATH.read_bytes()
@@ -63,7 +63,9 @@ def register_backend(evidence_dir, *, image_reference, image_sha256):
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())
-    cls = helper.register_inspect(runtime, name="ptb_python")
+    cls = helper.register_inspect(
+        runtime, name="ptb_python", **({"on_admission": on_admission} if on_admission is not None else {})
+    )
     original = cls.exec
 
     async def recording_exec(self, *args, **kwargs):

@@ -22,6 +22,8 @@ Options:
   --walltime <slurm-time>   Override computed Slurm walltime
   --preflight-only          Check the selected node without running PTB
   --runtime-smoke           Run a short GPU check in the configured SIF
+  --environment-acceptance humaneval  Run frozen native environment checks, no scientist
+  --nodelist <nodes>        Explicit frozen subset of the configured site nodes
   --hold                    Submit the job held; release it with scontrol
   --dry-run                 Print the sbatch command without submitting
   -h, --help                Show this help
@@ -41,6 +43,8 @@ REQUESTED_JUDGE_PROFILE=""
 WALLTIME=""
 PREFLIGHT_ONLY=0
 RUNTIME_SMOKE=0
+ENVIRONMENT_ACCEPTANCE=""
+REQUESTED_NODELIST=""
 DRY_RUN=0
 HOLD=0
 
@@ -59,6 +63,8 @@ while [ "$#" -gt 0 ]; do
         --walltime) WALLTIME="${2:?missing value for --walltime}"; shift 2 ;;
         --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --runtime-smoke) RUNTIME_SMOKE=1; shift ;;
+        --environment-acceptance) ENVIRONMENT_ACCEPTANCE="${2:?missing target}"; shift 2 ;;
+        --nodelist) REQUESTED_NODELIST="${2:?missing nodelist}"; shift 2 ;;
         --hold) HOLD=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -117,8 +123,35 @@ if [ "$PREFLIGHT_ONLY" = "1" ] && [ "$RUNTIME_SMOKE" = "1" ]; then
     echo "ERROR: --preflight-only and --runtime-smoke are mutually exclusive" >&2
     exit 2
 fi
+if [ -n "$ENVIRONMENT_ACCEPTANCE" ]; then
+    if [ "$ENVIRONMENT_ACCEPTANCE" != "humaneval" ] || [ "$PREFLIGHT_ONLY" = "1" ] || [ "$RUNTIME_SMOKE" = "1" ]; then
+        echo "ERROR: unsupported or combined environment acceptance mode" >&2
+        exit 2
+    fi
+    if [ "$HOLD" != "1" ] || [ "$WALLTIME" != "00:15:00" ]; then
+        echo "ERROR: environment acceptance requires held submission and 00:15:00 walltime" >&2
+        exit 2
+    fi
+fi
+if [ -n "$REQUESTED_NODELIST" ] && ! [[ "$REQUESTED_NODELIST" =~ ^[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*$ ]]; then
+    echo "ERROR: requested nodes must be explicit node names" >&2
+    exit 2
+fi
 
 source src/commit_utils/set_env_vars.sh
+
+# Modes come from this explicit invocation, never unrelated ambient flags.
+export POST_TRAIN_BENCH_SLURM_PREFLIGHT_ONLY="$PREFLIGHT_ONLY"
+export POST_TRAIN_BENCH_SLURM_RUNTIME_SMOKE="$RUNTIME_SMOKE"
+export POST_TRAIN_BENCH_ENVIRONMENT_ACCEPTANCE="$ENVIRONMENT_ACCEPTANCE"
+if [ -n "$REQUESTED_NODELIST" ]; then
+    if [ "$REQUESTED_NODELIST" != "${POST_TRAIN_BENCH_FROZEN_REQUESTED_NODES:-}" ]; then
+        echo "ERROR: requested nodes differ from frozen launcher placement" >&2
+        exit 1
+    fi
+else
+    unset POST_TRAIN_BENCH_FROZEN_REQUESTED_NODES
+fi
 
 SUBMIT_AS_ROOT="${POST_TRAIN_BENCH_SLURM_SUBMIT_AS_ROOT:-0}"
 RUN_AS_USER="${POST_TRAIN_BENCH_SLURM_RUN_AS_USER:-}"
@@ -200,7 +233,9 @@ if [ "$HOLD" = "1" ]; then
     SBATCH_ARGS+=(--hold)
 fi
 
-if [ -n "${POST_TRAIN_BENCH_SLURM_NODELIST:-}" ]; then
+if [ -n "$REQUESTED_NODELIST" ]; then
+    SBATCH_ARGS+=(--nodelist="$REQUESTED_NODELIST")
+elif [ -n "${POST_TRAIN_BENCH_SLURM_NODELIST:-}" ]; then
     SBATCH_ARGS+=(--nodelist="$POST_TRAIN_BENCH_SLURM_NODELIST")
 fi
 if [ -n "${POST_TRAIN_BENCH_SLURM_ACCOUNT:-}" ]; then
