@@ -184,7 +184,7 @@ if [ -n "${POST_TRAIN_BENCH_ENVIRONMENT_ACCEPTANCE:-}" ]; then
     fi
     # The runner persists success/failure evidence outside scratch before EXIT.
     # It never enters provider context probing or scientific run_task.sh.
-    python src/commit_utils/slurm/humaneval_environment_acceptance.py
+    python3 src/commit_utils/slurm/humaneval_environment_acceptance.py
     exit $?
 fi
 
